@@ -1,0 +1,75 @@
+steps:
+  - id: initialize-submodules
+    name: gcr.io/cloud-builders/git
+    args: [submodule, update, --init, --recursive]
+
+  - id: pull-build-cache
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - "docker pull ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest || true"
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --cache-from=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest
+      - --tag=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA
+      - --tag=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest
+      - .
+
+  - id: push-commit
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA
+
+  - id: push-latest
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest
+
+  - id: upload-vm-deployer
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - compute
+      - scp
+      - deploy/vm/deploy-trellis2.sh
+      - ${_VM_NAME}:/tmp/deploy-trellis2.sh
+      - --project=$PROJECT_ID
+      - --zone=${_VM_ZONE}
+      - --tunnel-through-iap
+      - --quiet
+
+  - id: deploy-on-gpu-vm
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - compute
+      - ssh
+      - ${_VM_NAME}
+      - --project=$PROJECT_ID
+      - --zone=${_VM_ZONE}
+      - --tunnel-through-iap
+      - --quiet
+      - "--command=sudo install -m 0755 /tmp/deploy-trellis2.sh /usr/local/bin/deploy-trellis2 && sudo /usr/local/bin/deploy-trellis2 ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA"
+
+substitutions:
+  _AR_LOCATION: northamerica-northeast1
+  _REPOSITORY: cloud-run-source-deploy
+  _IMAGE: trellis2-api
+  _VM_NAME: synode-comfyui-trellis-demo
+  _VM_ZONE: us-central1-c
+
+images:
+  - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA
+  - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest
+
+options:
+  machineType: E2_HIGHCPU_32
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 7200s

@@ -1,0 +1,59 @@
+# GCP: push GitHub main → Cloud Build tự build + deploy Cloud Run GPU.
+# Chỉ setup 1 lần trên Console (xem hướng dẫn bên dưới), sau đó mỗi git push là xong.
+#
+# Substitutions (đặt trong Cloud Build Trigger):
+#   _IMAGE        = asia-southeast1-docker.pkg.dev/PROJECT_ID/trellis2/service
+#   _REGION       = us-central1          (Cloud Run GPU: us-central1, europe-west4, asia-southeast1…)
+#   _SERVICE_NAME = trellis2
+#   _DEPLOY       = true                 (false = chỉ build image, không deploy)
+
+steps:
+  # --- 1. Build image ---
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - "--tag=${_IMAGE}:latest"
+      - "--tag=${_IMAGE}:$SHORT_SHA"
+      - "."
+
+  # --- 2. Deploy lên Cloud Run GPU (bỏ qua nếu _DEPLOY=false) ---
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        if [ "${_DEPLOY}" != "true" ]; then
+          echo "Skip deploy (_DEPLOY=${_DEPLOY})"
+          exit 0
+        fi
+        gcloud run deploy "${_SERVICE_NAME}" \
+          --project="$PROJECT_ID" \
+          --image="${_IMAGE}:$SHORT_SHA" \
+          --region="${_REGION}" \
+          --platform=managed \
+          --execution-environment=gen2 \
+          --port=8080 \
+          --memory=32Gi \
+          --cpu=8 \
+          --timeout=900 \
+          --concurrency=1 \
+          --min-instances=1 \
+          --max-instances=1 \
+          --gpu=1 \
+          --gpu-type=nvidia-l4 \
+          --no-cpu-throttling \
+          --set-secrets="HF_TOKEN=trellis2-hf-token:latest" \
+          --set-env-vars="ATTN_BACKEND=sdpa,SPARSE_ATTN_BACKEND=sdpa,SPARSE_CONV_BACKEND=none,TRELLIS2_MODEL=microsoft/TRELLIS.2-4B,HF_HOME=/tmp/huggingface" \
+          --allow-unauthenticated
+
+images:
+  - "${_IMAGE}:latest"
+  - "${_IMAGE}:$SHORT_SHA"
+
+options:
+  machineType: E2_HIGHCPU_32
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 7200s

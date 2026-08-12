@@ -1,0 +1,8 @@
+.git
+.gitmodules
+**/__pycache__
+**/*.pyc
+tmp/
+*.glb
+*.mp4
+.env

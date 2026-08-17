@@ -1,0 +1,12 @@
+steps:
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - compute
+      - ssh
+      - synode-comfyui-trellis-demo
+      - --project=synode-rc
+      - --zone=us-central1-c
+      - --tunnel-through-iap
+      - --quiet
+      - --command=sudo sh -c 'echo CLOUD_BUILD_OK && hostname && nvidia-smi && docker --version'

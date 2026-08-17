@@ -4,6 +4,12 @@
 # Toolkit. CUDA, PyTorch, TRELLIS.2, and all CUDA extensions are in the image.
 
 steps:
+  # o-voxel depends on Eigen, stored as a Git submodule. Cloud Build source
+  # checkouts do not guarantee recursive submodules, so initialize it here.
+  - id: initialize-submodules
+    name: gcr.io/cloud-builders/git
+    args: [submodule, update, --init, --recursive]
+
   - id: build
     name: gcr.io/cloud-builders/docker
     args:
@@ -63,6 +69,7 @@ images:
   - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest
 
 options:
+  machineType: E2_HIGHCPU_32
   logging: CLOUD_LOGGING_ONLY
 
 timeout: 7200s

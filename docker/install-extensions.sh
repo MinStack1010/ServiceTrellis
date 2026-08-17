@@ -3,6 +3,10 @@ set -euo pipefail
 
 mkdir -p /tmp/extensions
 
+# Matches the official TRELLIS.2 setup script. The runtime defaults to SDPA,
+# but FlashAttention is present in the image when ATTN_BACKEND=flash_attn is set.
+pip install flash-attn==2.7.3 --no-build-isolation
+
 if [ ! -d /tmp/extensions/nvdiffrast/.git ]; then
   git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast
 fi

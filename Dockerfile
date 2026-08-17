@@ -2,6 +2,8 @@
 # Requires an NVIDIA GPU with 24 GB+ VRAM and NVIDIA Container Toolkit.
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
 
+# Cloud Build has no GPU. Compile CUDA extensions only for the VM's L4
+# (Ada, SM 8.9) instead of asking PyTorch to inspect a visible GPU.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -10,6 +12,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ATTN_BACKEND=sdpa \
     SPARSE_ATTN_BACKEND=sdpa \
     SPARSE_CONV_BACKEND=none \
+    TORCH_CUDA_ARCH_LIST=8.9 \
+    CMAKE_CUDA_ARCHITECTURES=89 \
+    MAX_JOBS=4 \
     HF_HOME=/data/huggingface \
     PORT=8080
 
@@ -24,6 +29,7 @@ RUN pip install --upgrade pip && pip install -r requirements-service.txt
 
 COPY . .
 RUN chmod +x docker/install-extensions.sh && docker/install-extensions.sh
+RUN python -c "import torch; assert torch.version.cuda == '12.4'; print(torch.__version__)" && pip check
 
 RUN mkdir -p /data/huggingface /app/tmp
 

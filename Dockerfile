@@ -27,9 +27,15 @@ WORKDIR /app
 COPY requirements-service.txt ./
 RUN pip install --upgrade pip && pip install -r requirements-service.txt
 
-COPY . .
+# Keep expensive CUDA-extension compilation in a stable layer. Normal edits to
+# api_server.py or Cloud Build files below will reuse this layer from :latest.
+COPY docker/install-extensions.sh ./docker/install-extensions.sh
+COPY o-voxel ./o-voxel
 RUN chmod +x docker/install-extensions.sh && docker/install-extensions.sh
 RUN python -c "import torch; assert torch.version.cuda == '12.4'; print(torch.__version__)" && pip check
+
+# Application code changes do not invalidate the cached dependency layers.
+COPY . .
 
 RUN mkdir -p /data/huggingface /app/tmp
 

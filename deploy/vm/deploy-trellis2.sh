@@ -1,15 +1,31 @@
 #!/usr/bin/env bash
 # Runs on the GPU VM. Cloud Build uploads and invokes this script via IAP.
 # All Python/CUDA/TRELLIS dependencies stay inside the Docker image.
+# Use the VM metadata identity directly. This avoids a root/user gcloud
+# credential mismatch when Cloud Build invokes this script through SSH.
 set -euo pipefail
 
 IMAGE="${1:?Image reference is required}"
-HF_SECRET="${2:-trellis2-hf-token}"
 REGISTRY="${IMAGE%%/*}"
 CONTAINER="trellis2-api"
+HF_SECRET="trellis2-hf-token"
 
-gcloud auth configure-docker "${REGISTRY}" --quiet
-HF_TOKEN="$(gcloud secrets versions access latest --secret="${HF_SECRET}")"
+metadata() {
+  curl -fsS -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/$1"
+}
+
+PROJECT_ID="$(metadata project/project-id)"
+ACCESS_TOKEN="$(metadata instance/service-accounts/default/token | python3 -c 'import json, sys; print(json.load(sys.stdin)["access_token"])')"
+HF_TOKEN="$({
+  curl -fsS \
+    -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+    "https://secretmanager.googleapis.com/v1/projects/${PROJECT_ID}/secrets/${HF_SECRET}/versions/latest:access" \
+    | python3 -c 'import base64, json, sys; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode(), end="")'
+})"
+
+# Artifact Registry accepts the VM's short-lived OAuth token. Refresh it at
+# every deployment instead of storing a Docker credential on the VM.
+printf '%s' "${ACCESS_TOKEN}" | docker login -u oauth2accesstoken --password-stdin "https://${REGISTRY}"
 
 docker pull "${IMAGE}"
 NEW_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${IMAGE}")"
@@ -31,5 +47,5 @@ docker run -d \
   -v trellis-hf:/data/huggingface \
   "${IMAGE}"
 
-unset HF_TOKEN
+unset ACCESS_TOKEN HF_TOKEN
 echo "${CONTAINER} is now running ${IMAGE}."

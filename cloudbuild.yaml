@@ -10,10 +10,20 @@ steps:
     name: gcr.io/cloud-builders/git
     args: [submodule, update, --init, --recursive]
 
+  # Cloud Build workers are ephemeral. Pull the previously successful image so
+  # Docker can reuse the CUDA-extension layers on later commits.
+  - id: pull-build-cache
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - "docker pull ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest || true"
+
   - id: build
     name: gcr.io/cloud-builders/docker
     args:
       - build
+      - --cache-from=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest
       - --tag=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA
       - --tag=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:latest
       - .
@@ -54,7 +64,7 @@ steps:
       - --zone=${_VM_ZONE}
       - --tunnel-through-iap
       - --quiet
-      - "--command=sudo install -m 0755 /tmp/deploy-trellis2.sh /usr/local/bin/deploy-trellis2 && sudo /usr/local/bin/deploy-trellis2 ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA ${_HF_SECRET}"
+      - "--command=sudo install -m 0755 /tmp/deploy-trellis2.sh /usr/local/bin/deploy-trellis2 && sudo /usr/local/bin/deploy-trellis2 ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA"
 
 substitutions:
   _AR_LOCATION: northamerica-northeast1
@@ -62,7 +72,6 @@ substitutions:
   _IMAGE: trellis2-api
   _VM_NAME: synode-comfyui-trellis-demo
   _VM_ZONE: us-central1-c
-  _HF_SECRET: trellis2-hf-token
 
 images:
   - ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA

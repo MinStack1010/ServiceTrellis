@@ -1,11 +1,11 @@
 # GitHub main -> Cloud Build -> Artifact Registry -> IAP -> G2 GPU VM.
+# This file is at the root of the ServiceTrellis GitHub repository.
 # The VM only needs the NVIDIA driver, Docker, gcloud, and NVIDIA Container
 # Toolkit. CUDA, PyTorch, TRELLIS.2, and all CUDA extensions are in the image.
 
 steps:
   - id: build
     name: gcr.io/cloud-builders/docker
-    dir: TRELLIS.2
     args:
       - build
       - --tag=${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA
@@ -26,7 +26,6 @@ steps:
 
   - id: upload-vm-deployer
     name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
-    dir: TRELLIS.2
     entrypoint: gcloud
     args:
       - compute
@@ -52,8 +51,8 @@ steps:
       - "--command=sudo install -m 0755 /tmp/deploy-trellis2.sh /usr/local/bin/deploy-trellis2 && sudo /usr/local/bin/deploy-trellis2 ${_AR_LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$COMMIT_SHA ${_HF_SECRET}"
 
 substitutions:
-  _AR_LOCATION: us-central1
-  _REPOSITORY: synode
+  _AR_LOCATION: northamerica-northeast1
+  _REPOSITORY: cloud-run-source-deploy
   _IMAGE: trellis2-api
   _VM_NAME: synode-comfyui-trellis-demo
   _VM_ZONE: us-central1-c

@@ -8,6 +8,11 @@ if [ ! -d /tmp/extensions/nvdiffrast/.git ]; then
 fi
 pip install /tmp/extensions/nvdiffrast --no-build-isolation
 
+if [ ! -d /tmp/extensions/nvdiffrec/.git ]; then
+  git clone -b renderutils https://github.com/JeffreyXiang/nvdiffrec.git /tmp/extensions/nvdiffrec
+fi
+pip install /tmp/extensions/nvdiffrec --no-build-isolation
+
 if [ ! -d /tmp/extensions/CuMesh/.git ]; then
   git clone https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh --recursive
 fi

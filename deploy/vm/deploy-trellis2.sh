@@ -41,7 +41,7 @@ docker run -d \
   --name "${CONTAINER}" \
   --restart unless-stopped \
   --gpus all \
-  -p 127.0.0.1:8080:8080 \
+  -p 0.0.0.0:8080:8080 \
   -e HF_TOKEN="${HF_TOKEN}" \
   -e HF_HOME=/data/huggingface \
   -v trellis-hf:/data/huggingface \

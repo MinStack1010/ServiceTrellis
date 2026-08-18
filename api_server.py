@@ -119,11 +119,26 @@ async def generate(request: GenerateRequest):
         meshes = pipeline.run(
             image,
             seed=request.seed,
-            preprocess_image=True,
-            pipeline_type=pipeline_type,
-            sparse_structure_sampler_params={"steps": request.ss_sampling_steps},
-            shape_slat_sampler_params={"steps": request.shape_slat_sampling_steps},
-            tex_slat_sampler_params={"steps": request.tex_slat_sampling_steps},
+        preprocess_image=True,
+        pipeline_type=pipeline_type,
+        sparse_structure_sampler_params={
+            "steps": request.ss_sampling_steps,
+            "guidance_strength": request.ss_guidance_strength,
+            "guidance_rescale": request.ss_guidance_rescale,
+            "rescale_t": request.ss_rescale_t,
+        },
+        shape_slat_sampler_params={
+            "steps": request.shape_slat_sampling_steps,
+            "guidance_strength": request.shape_slat_guidance_strength,
+            "guidance_rescale": request.shape_slat_guidance_rescale,
+            "rescale_t": request.shape_slat_rescale_t,
+        },
+        tex_slat_sampler_params={
+            "steps": request.tex_slat_sampling_steps,
+            "guidance_strength": request.tex_slat_guidance_strength,
+            "guidance_rescale": request.tex_slat_guidance_rescale,
+            "rescale_t": request.tex_slat_rescale_t,
+        },
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Generation failed: {exc}") from exc

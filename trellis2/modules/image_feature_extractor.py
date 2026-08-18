@@ -83,7 +83,12 @@ class DinoV3FeatureExtractor:
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
 
-        for i, layer_module in enumerate(self.model.layer):
+        # Transformers moved the DINOv3 encoder under ``model``.  Retain
+        # compatibility with the earlier layout used when TRELLIS.2 shipped.
+        layers = getattr(self.model, "layer", None)
+        if layers is None:
+            layers = self.model.model.layer
+        for layer_module in layers:
             hidden_states = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,

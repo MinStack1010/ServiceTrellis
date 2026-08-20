@@ -10,6 +10,7 @@ Usage:
 import argparse
 import asyncio
 import base64
+import functools
 import io
 import logging
 import os
@@ -81,12 +82,17 @@ class Job:
 jobs: dict[str, Job] = {}
 job_queue: asyncio.Queue = None
 worker_task: asyncio.Task = None
+cleanup_task: asyncio.Task = None
 processing_lock = asyncio.Lock()
+
+# Jobs are removed from memory this many seconds after they finish (success or failure).
+# This prevents unbounded RAM growth from accumulated GLB payloads.
+JOB_TTL_SECONDS = 3600  # 1 hour
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pipeline, job_queue, worker_task
+    global pipeline, job_queue, worker_task, cleanup_task
 
     model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
@@ -95,17 +101,19 @@ async def lifespan(app: FastAPI):
     # Initialize job queue and start worker
     job_queue = asyncio.Queue()
     worker_task = asyncio.create_task(job_worker())
-    logger.info("Job worker started")
+    cleanup_task = asyncio.create_task(job_cleanup_worker())
+    logger.info("Job worker and cleanup worker started")
     
     yield
     
     # Cleanup
-    if worker_task:
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
+    for task in (worker_task, cleanup_task):
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     pipeline = None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -204,8 +212,42 @@ async def job_worker():
             logger.error(f"Traceback:\n{traceback.format_exc()}")
 
 
+async def job_cleanup_worker():
+    """Periodically evict completed/failed jobs older than JOB_TTL_SECONDS.
+
+    Each finished job can hold tens of MB of base64 GLB data in RAM.
+    Without cleanup the server will eventually OOM on long-running deployments.
+    """
+    while True:
+        try:
+            await asyncio.sleep(300)  # check every 5 minutes
+            now = time.time()
+            expired = [
+                job_id
+                for job_id, job in list(jobs.items())
+                if job.completed_at is not None
+                and now - job.completed_at > JOB_TTL_SECONDS
+            ]
+            for job_id in expired:
+                jobs.pop(job_id, None)
+            if expired:
+                logger.info(f"Evicted {len(expired)} expired job(s) from memory")
+        except asyncio.CancelledError:
+            logger.info("Cleanup worker cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Cleanup worker error: {e}")
+
+
 async def process_job(job: Job):
-    """Process a single job."""
+    """Process a single job.
+
+    pipeline.run() and _export_glb() are both CPU/GPU-bound blocking calls.
+    Running them directly on the asyncio event loop would freeze the entire
+    server (including /health and /jobs/{id} endpoints) for the full
+    generation duration (30-120 s).  We offload them to a thread-pool
+    executor so the event loop stays responsive.
+    """
     global pipeline
     
     job.status = JobStatus.PROCESSING
@@ -214,6 +256,8 @@ async def process_job(job: Job):
     job.message = "Starting generation..."
     logger.info(f"Processing job {job.job_id}")
     
+    loop = asyncio.get_event_loop()
+
     try:
         # Decode image
         job.message = "Decoding image..."
@@ -223,12 +267,11 @@ async def process_job(job: Job):
         
         pipeline_type = PIPELINE_TYPE_MAP.get(job.request.pipeline_type, job.request.pipeline_type)
         
-        # Run generation with progress updates
+        # Run generation — blocking GPU call, offloaded to thread pool
         job.message = "Generating sparse structure..."
         job.progress = 10.0
         
-        meshes = pipeline.run(
-            image,
+        run_kwargs = dict(
             seed=job.request.seed,
             preprocess_image=True,
             pipeline_type=pipeline_type,
@@ -251,15 +294,20 @@ async def process_job(job: Job):
                 "rescale_t": job.request.tex_slat_rescale_t,
             },
         )
+        meshes = await loop.run_in_executor(
+            None, functools.partial(pipeline.run, image, **run_kwargs)
+        )
         
         job.message = "Processing mesh..."
         job.progress = 70.0
         mesh = meshes[0]
-        mesh.simplify(16777216)
+        await loop.run_in_executor(None, functools.partial(mesh.simplify, 16777216))
         
         job.message = "Exporting GLB..."
         job.progress = 80.0
-        glb_bytes = _export_glb(mesh, job.request)
+        glb_bytes = await loop.run_in_executor(
+            None, functools.partial(_export_glb, mesh, job.request)
+        )
         
         job.message = "Finalizing..."
         job.progress = 95.0

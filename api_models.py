@@ -1,4 +1,5 @@
 """Pydantic request/response models for the TRELLIS.2 API server."""
+from enum import Enum
 from pydantic import BaseModel, Field
 
 
@@ -51,7 +52,7 @@ class HealthResponse(BaseModel):
     weights_loaded: bool = False
 
 
-class JobStatus(str):
+class JobStatus(str, Enum):
     """Job status enum."""
     QUEUED = "queued"
     PROCESSING = "processing"

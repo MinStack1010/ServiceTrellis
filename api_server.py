@@ -8,6 +8,7 @@ Usage:
     python api_server.py --port 8080
 """
 import argparse
+import asyncio
 import base64
 import io
 import logging
@@ -15,7 +16,10 @@ import os
 import tempfile
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Optional
 
 import o_voxel
 import torch
@@ -25,7 +29,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
 
-from api_models import GenerateRequest, GenerateResponse, HealthResponse
+from api_models import (
+    GenerateRequest,
+    GenerateResponse,
+    HealthResponse,
+    JobResponse,
+    JobStatus,
+    JobStatusResponse,
+)
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
 logging.basicConfig(
@@ -51,14 +62,50 @@ PIPELINE_TYPE_MAP = {
 pipeline: Trellis2ImageTo3DPipeline | None = None
 
 
+@dataclass
+class Job:
+    """Job data structure."""
+    job_id: str
+    request: GenerateRequest
+    status: JobStatus = JobStatus.QUEUED
+    progress: float = 0.0
+    message: str = ""
+    result: Optional[GenerateResponse] = None
+    error: str = ""
+    created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+
+
+# In-memory job storage
+jobs: dict[str, Job] = {}
+job_queue: asyncio.Queue = None
+worker_task: asyncio.Task = None
+processing_lock = asyncio.Lock()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pipeline
+    global pipeline, job_queue, worker_task
 
     model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
     pipeline.cuda()
+    
+    # Initialize job queue and start worker
+    job_queue = asyncio.Queue()
+    worker_task = asyncio.create_task(job_worker())
+    logger.info("Job worker started")
+    
     yield
+    
+    # Cleanup
+    if worker_task:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
     pipeline = None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -135,80 +182,161 @@ def _export_glb(mesh, request: GenerateRequest) -> bytes:
             logger.info(f"Temporary file cleaned up: {glb_path}")
 
 
-@app.post("/generate", response_model=GenerateResponse)
-async def generate(request: GenerateRequest):
-    if pipeline is None:
-        raise HTTPException(status_code=503, detail="Pipeline not ready")
+async def job_worker():
+    """Background worker that processes jobs one at a time."""
+    while True:
+        try:
+            job_id = await job_queue.get()
+            job = jobs.get(job_id)
+            if not job:
+                logger.error(f"Job {job_id} not found in storage")
+                continue
+            
+            async with processing_lock:
+                await process_job(job)
+            
+            job_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("Job worker cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Job worker error: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
 
-    t_start = time.time()
 
+async def process_job(job: Job):
+    """Process a single job."""
+    global pipeline
+    
+    job.status = JobStatus.PROCESSING
+    job.started_at = time.time()
+    job.progress = 0.0
+    job.message = "Starting generation..."
+    logger.info(f"Processing job {job.job_id}")
+    
     try:
-        image_bytes = base64.b64decode(request.image)
+        # Decode image
+        job.message = "Decoding image..."
+        job.progress = 5.0
+        image_bytes = base64.b64decode(job.request.image)
         image = Image.open(io.BytesIO(image_bytes))
-    except Exception as exc:
-        logger.error(f"Image decoding failed: {exc}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=400, detail=f"Invalid image: {exc}") from exc
-
-    pipeline_type = PIPELINE_TYPE_MAP.get(request.pipeline_type, request.pipeline_type)
-
-    try:
+        
+        pipeline_type = PIPELINE_TYPE_MAP.get(job.request.pipeline_type, job.request.pipeline_type)
+        
+        # Run generation with progress updates
+        job.message = "Generating sparse structure..."
+        job.progress = 10.0
+        
         meshes = pipeline.run(
             image,
-            seed=request.seed,
+            seed=job.request.seed,
             preprocess_image=True,
             pipeline_type=pipeline_type,
             sparse_structure_sampler_params={
-                "steps": request.ss_sampling_steps,
-                "guidance_strength": request.ss_guidance_strength,
-                "guidance_rescale": request.ss_guidance_rescale,
-                "rescale_t": request.ss_rescale_t,
+                "steps": job.request.ss_sampling_steps,
+                "guidance_strength": job.request.ss_guidance_strength,
+                "guidance_rescale": job.request.ss_guidance_rescale,
+                "rescale_t": job.request.ss_rescale_t,
             },
             shape_slat_sampler_params={
-                "steps": request.shape_slat_sampling_steps,
-                "guidance_strength": request.shape_slat_guidance_strength,
-                "guidance_rescale": request.shape_slat_guidance_rescale,
-                "rescale_t": request.shape_slat_rescale_t,
+                "steps": job.request.shape_slat_sampling_steps,
+                "guidance_strength": job.request.shape_slat_guidance_strength,
+                "guidance_rescale": job.request.shape_slat_guidance_rescale,
+                "rescale_t": job.request.shape_slat_rescale_t,
             },
             tex_slat_sampler_params={
-                "steps": request.tex_slat_sampling_steps,
-                "guidance_strength": request.tex_slat_guidance_strength,
-                "guidance_rescale": request.tex_slat_guidance_rescale,
-                "rescale_t": request.tex_slat_rescale_t,
+                "steps": job.request.tex_slat_sampling_steps,
+                "guidance_strength": job.request.tex_slat_guidance_strength,
+                "guidance_rescale": job.request.tex_slat_guidance_rescale,
+                "rescale_t": job.request.tex_slat_rescale_t,
             },
         )
-    except Exception as exc:
-        logger.error(f"Generation failed: {exc}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Generation failed: {exc}") from exc
-
-    mesh = meshes[0]
-    mesh.simplify(16777216)
-
-    try:
-        glb_bytes = _export_glb(mesh, request)
-        logger.info(f"GLB export successful, size: {len(glb_bytes)} bytes")
-    except Exception as exc:
-        logger.error(f"GLB export failed: {exc}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"GLB export failed: {exc}") from exc
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    try:
-        response = GenerateResponse(
+        
+        job.message = "Processing mesh..."
+        job.progress = 70.0
+        mesh = meshes[0]
+        mesh.simplify(16777216)
+        
+        job.message = "Exporting GLB..."
+        job.progress = 80.0
+        glb_bytes = _export_glb(mesh, job.request)
+        
+        job.message = "Finalizing..."
+        job.progress = 95.0
+        
+        generation_time = time.time() - job.started_at
+        job.result = GenerateResponse(
             glb=base64.b64encode(glb_bytes).decode(),
             vertices=int(mesh.vertices.shape[0]),
             faces=int(mesh.faces.shape[0]),
-            generation_time=round(time.time() - t_start, 2),
+            generation_time=round(generation_time, 2),
         )
-        logger.info(f"Response created successfully, generation time: {response.generation_time}s")
-        return response
+        
+        job.status = JobStatus.COMPLETED
+        job.progress = 100.0
+        job.message = "Generation completed"
+        job.completed_at = time.time()
+        logger.info(f"Job {job.job_id} completed in {generation_time:.2f}s")
+        
     except Exception as exc:
-        logger.error(f"Response creation/serialization failed: {exc}")
+        job.status = JobStatus.FAILED
+        job.error = str(exc)
+        job.message = f"Generation failed: {exc}"
+        job.completed_at = time.time()
+        logger.error(f"Job {job.job_id} failed: {exc}")
         logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Response serialization failed: {exc}") from exc
+    finally:
+        # GPU cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info(f"GPU cache cleared for job {job.job_id}")
+
+
+@app.post("/generate", response_model=JobResponse)
+async def generate(request: GenerateRequest):
+    """Create a new generation job and return job ID immediately."""
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not ready")
+    
+    # Validate image
+    try:
+        image_bytes = base64.b64decode(request.image)
+        Image.open(io.BytesIO(image_bytes))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {exc}") from exc
+    
+    # Create job
+    job_id = str(uuid.uuid4())
+    job = Job(
+        job_id=job_id,
+        request=request,
+        status=JobStatus.QUEUED,
+        message="Job queued",
+    )
+    jobs[job_id] = job
+    
+    # Add to queue
+    await job_queue.put(job_id)
+    logger.info(f"Job {job_id} created and queued")
+    
+    return JobResponse(job_id=job_id, status=JobStatus.QUEUED)
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """Get the status of a job."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return JobStatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        progress=job.progress,
+        message=job.message,
+        result=job.result,
+        error=job.error,
+    )
 
 
 def main():

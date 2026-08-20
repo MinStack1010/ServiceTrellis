@@ -49,3 +49,29 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     backend: str = "cuda"
     weights_loaded: bool = False
+
+
+class JobStatus(str):
+    """Job status enum."""
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class JobResponse(BaseModel):
+    """Response for job creation."""
+
+    job_id: str = Field(..., description="Unique job identifier")
+    status: JobStatus = Field(..., description="Current job status")
+
+
+class JobStatusResponse(BaseModel):
+    """Response for job status check."""
+
+    job_id: str = Field(..., description="Unique job identifier")
+    status: JobStatus = Field(..., description="Current job status")
+    progress: float = Field(default=0.0, ge=0.0, le=100.0, description="Progress percentage (0-100)")
+    message: str = Field(default="", description="Status message")
+    result: GenerateResponse | None = Field(default=None, description="Generation result when completed")
+    error: str = Field(default="", description="Error message when failed")

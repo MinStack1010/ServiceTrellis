@@ -2,7 +2,7 @@
 FastAPI server for Microsoft TRELLIS.2 image-to-3D generation.
 
 - GET  /health   — server status
-- POST /generate — base64 image → GLB
+- POST /generate — base64 image → GLB (uploaded to GCS, returns public URL)
 
 Usage:
     python api_server.py --port 8080
@@ -28,6 +28,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from google.cloud import storage as gcs
 from PIL import Image
 
 from api_models import (
@@ -60,7 +61,21 @@ PIPELINE_TYPE_MAP = {
     "1536_cascade": "1536_cascade",
 }
 
+# GCS bucket where generated GLB files are stored.
+# The bucket must have "allUsers → Storage Object Viewer" for public access.
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "synode-trellis-iframe")
+GCS_GLB_PREFIX = "generated"   # objects are stored as generated/{job_id}.glb
+
 pipeline: Trellis2ImageTo3DPipeline | None = None
+_gcs_client: gcs.Client | None = None
+
+
+def _get_gcs_client() -> gcs.Client:
+    """Return a cached GCS client (uses Workload Identity / ADC automatically)."""
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = gcs.Client()
+    return _gcs_client
 
 
 @dataclass
@@ -145,7 +160,12 @@ async def health():
     return HealthResponse(status="ok", weights_loaded=True)
 
 
-def _export_glb(mesh, request: GenerateRequest) -> bytes:
+def _export_and_upload_glb(mesh, request: GenerateRequest, job_id: str) -> str:
+    """Export mesh to GLB, upload to GCS, return public URL.
+
+    Returns the public HTTPS URL of the uploaded GLB object.
+    The temporary local file is always cleaned up before returning.
+    """
     logger.info("Starting GLB export...")
     try:
         glb = o_voxel.postprocess.to_glb(
@@ -158,9 +178,7 @@ def _export_glb(mesh, request: GenerateRequest) -> bytes:
             aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
             decimation_target=request.decimation_target,
             texture_size=request.texture_size,
-            remesh=True,
-            remesh_band=1,
-            remesh_project=0,
+            remesh=False,   # remesh=True costs 1–4 min CPU; decimation alone is sufficient
             verbose=False,
         )
         logger.info("GLB object created successfully")
@@ -176,12 +194,20 @@ def _export_glb(mesh, request: GenerateRequest) -> bytes:
         logger.info(f"Exporting GLB to temporary file: {glb_path}")
         glb.export(glb_path, extension_webp=True)
         logger.info("GLB export to file successful")
-        with open(glb_path, "rb") as f:
-            data = f.read()
-            logger.info(f"GLB file read successfully, size: {len(data)} bytes")
-            return data
+
+        # Upload to GCS
+        object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
+        bucket = _get_gcs_client().bucket(GCS_BUCKET)
+        blob = bucket.blob(object_name)
+        blob.upload_from_filename(glb_path, content_type="model/gltf-binary")
+        # The bucket has allUsers → Storage Object Viewer, so every uploaded
+        # object is publicly readable without an explicit make_public() call.
+        public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
+        logger.info(f"GLB uploaded to GCS: {public_url}")
+        return public_url
+
     except Exception as exc:
-        logger.error(f"GLB file export/read failed: {exc}")
+        logger.error(f"GLB export/upload failed: {exc}")
         logger.error(f"Traceback:\n{traceback.format_exc()}")
         raise
     finally:
@@ -303,10 +329,10 @@ async def process_job(job: Job):
         mesh = meshes[0]
         await loop.run_in_executor(None, functools.partial(mesh.simplify, 16777216))
         
-        job.message = "Exporting GLB..."
+        job.message = "Exporting & uploading GLB..."
         job.progress = 80.0
-        glb_bytes = await loop.run_in_executor(
-            None, functools.partial(_export_glb, mesh, job.request)
+        glb_url = await loop.run_in_executor(
+            None, functools.partial(_export_and_upload_glb, mesh, job.request, job.job_id)
         )
         
         job.message = "Finalizing..."
@@ -314,7 +340,7 @@ async def process_job(job: Job):
         
         generation_time = time.time() - job.started_at
         job.result = GenerateResponse(
-            glb=base64.b64encode(glb_bytes).decode(),
+            glb_url=glb_url,
             vertices=int(mesh.vertices.shape[0]),
             faces=int(mesh.faces.shape[0]),
             generation_time=round(generation_time, 2),

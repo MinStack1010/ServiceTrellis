@@ -38,7 +38,7 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     """Response containing the generated 3D model."""
 
-    glb: str = Field(..., description="Base64-encoded GLB file")
+    glb_url: str = Field(..., description="Public GCS URL of the exported GLB file")
     vertices: int = Field(..., description="Number of vertices in the output mesh")
     faces: int = Field(..., description="Number of faces in the output mesh")
     generation_time: float = Field(..., description="Generation time in seconds")

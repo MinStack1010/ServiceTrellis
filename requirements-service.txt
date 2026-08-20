@@ -5,6 +5,7 @@ pydantic
 accelerate
 easydict
 fast-simplification
+google-cloud-storage
 huggingface_hub
 imageio
 kornia

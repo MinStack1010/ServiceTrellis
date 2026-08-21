@@ -101,23 +101,27 @@ class Job:
 
 
 # ─── Persistent Job Store ────────────────────────────────────────────────────
-# Jobs are stored in Redis when available so they survive server restarts.
-# Falls back transparently to an in-memory dict when Redis is not configured
-# or unreachable — in that mode jobs are still lost on restart (same as before).
+# Job state is written to a JSON file on disk so it survives container restarts.
+# The file lives in JOB_STATE_PATH (default /app/tmp/jobs.json).
+# No external service required — works with the existing Docker volume setup.
+#
+# Optional Redis: set REDIS_URL env var to use Redis instead (e.g. when
+# running multiple replicas). Falls back to file store if Redis is unreachable.
 
+JOB_STATE_PATH = os.environ.get("JOB_STATE_PATH", "/app/tmp/jobs.json")
 REDIS_URL = os.environ.get("REDIS_URL", "")
 REDIS_JOB_PREFIX = "trellis:job:"
-# Jobs are kept in Redis for this many seconds after they finish.
-REDIS_JOB_TTL = 3600  # 1 hour
+REDIS_JOB_TTL = 3600  # 1 hour — TTL for completed/failed jobs in Redis
 
 try:
     import redis.asyncio as aioredis  # type: ignore
     _redis_available = True
 except ImportError:
     _redis_available = False
-    logger.warning("redis package not installed — using in-memory job store (jobs lost on restart)")
 
 _redis_client: "aioredis.Redis | None" = None  # type: ignore[name-defined]
+_redis_init_lock = asyncio.Lock()  # B-M2: ngăn tạo 2 clients đồng thời
+_file_store_lock = asyncio.Lock()  # serialize file writes
 
 
 async def _get_redis() -> "aioredis.Redis | None":  # type: ignore[name-defined]
@@ -125,26 +129,28 @@ async def _get_redis() -> "aioredis.Redis | None":  # type: ignore[name-defined]
     global _redis_client
     if not _redis_available or not REDIS_URL:
         return None
-    if _redis_client is None:
-        try:
-            _redis_client = aioredis.from_url(  # type: ignore[union-attr]
-                REDIS_URL,
-                decode_responses=True,
-                socket_connect_timeout=2,
-                socket_timeout=2,
-            )
-            # Ping để kiểm tra kết nối ngay lúc khởi động
-            await _redis_client.ping()
-            logger.info(f"Redis connected: {REDIS_URL}")
-        except Exception as exc:
-            logger.warning(f"Redis connection failed ({exc}) — falling back to in-memory store")
-            _redis_client = None
+    if _redis_client is not None:
+        return _redis_client
+    async with _redis_init_lock:  # B-M2: double-checked locking
+        if _redis_client is None:
+            try:
+                _redis_client = aioredis.from_url(  # type: ignore[union-attr]
+                    REDIS_URL,
+                    decode_responses=True,
+                    socket_connect_timeout=2,
+                    socket_timeout=2,
+                )
+                await _redis_client.ping()
+                logger.info(f"Redis connected: {REDIS_URL}")
+            except Exception as exc:
+                logger.warning(f"Redis unavailable ({exc}) — using file-based job store")
+                _redis_client = None
     return _redis_client
 
 
-def _job_to_dict(job: Job) -> dict:
+def _job_to_dict(job: "Job") -> dict:
     """Serialize Job to a JSON-safe dict."""
-    d = {
+    return {
         "job_id": job.job_id,
         "request": job.request.dict(),
         "status": job.status.value,
@@ -156,10 +162,9 @@ def _job_to_dict(job: Job) -> dict:
         "started_at": job.started_at,
         "completed_at": job.completed_at,
     }
-    return d
 
 
-def _dict_to_job(d: dict) -> Job:
+def _dict_to_job(d: dict) -> "Job":
     """Deserialize a dict back to a Job."""
     result = GenerateResponse(**d["result"]) if d.get("result") else None
     return Job(
@@ -176,7 +181,51 @@ def _dict_to_job(d: dict) -> Job:
     )
 
 
-async def _save_job(job: Job) -> None:
+# ── File-based store ──────────────────────────────────────────────────────────
+
+def _write_jobs_file_sync(snapshot: dict) -> None:
+    """Write jobs snapshot to disk (sync — called from asyncio via executor)."""
+    os.makedirs(os.path.dirname(JOB_STATE_PATH), exist_ok=True)
+    tmp_path = JOB_STATE_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(snapshot, f)
+    os.replace(tmp_path, JOB_STATE_PATH)  # atomic rename
+
+
+async def _flush_jobs_to_file() -> None:
+    """Persist all current jobs to disk (async, with lock)."""
+    async with _file_store_lock:
+        snapshot = {jid: _job_to_dict(j) for jid, j in jobs.items()}
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, _write_jobs_file_sync, snapshot)
+        except Exception as exc:
+            logger.warning(f"Job file write failed: {exc}")
+
+
+def _load_jobs_from_file() -> dict[str, "Job"]:
+    """Load jobs from disk file on startup (sync, called before event loop tasks)."""
+    if not os.path.exists(JOB_STATE_PATH):
+        return {}
+    try:
+        with open(JOB_STATE_PATH) as f:
+            raw = json.load(f)
+        restored = {}
+        for jid, d in raw.items():
+            try:
+                restored[jid] = _dict_to_job(d)
+            except Exception as exc:
+                logger.warning(f"Skipping malformed job {jid}: {exc}")
+        logger.info(f"Restored {len(restored)} job(s) from {JOB_STATE_PATH}")
+        return restored
+    except Exception as exc:
+        logger.warning(f"Could not read job file ({exc}) — starting fresh")
+        return {}
+
+
+# ── Redis store ───────────────────────────────────────────────────────────────
+
+async def _save_job_redis(job: "Job") -> None:
     """Persist job to Redis (no-op if Redis is unavailable)."""
     r = await _get_redis()
     if r is None:
@@ -184,7 +233,6 @@ async def _save_job(job: Job) -> None:
     key = f"{REDIS_JOB_PREFIX}{job.job_id}"
     try:
         payload = json.dumps(_job_to_dict(job))
-        # Finished jobs expire after TTL; active jobs kept indefinitely until finished
         ttl = REDIS_JOB_TTL if job.completed_at is not None else 0
         if ttl:
             await r.setex(key, ttl, payload)
@@ -194,12 +242,12 @@ async def _save_job(job: Job) -> None:
         logger.warning(f"Redis save failed for job {job.job_id}: {exc}")
 
 
-async def _load_all_jobs_from_redis() -> dict[str, Job]:
-    """Restore active/recent jobs from Redis on startup."""
+async def _load_all_jobs_from_redis() -> dict[str, "Job"]:
+    """Restore jobs from Redis on startup."""
     r = await _get_redis()
     if r is None:
         return {}
-    restored: dict[str, Job] = {}
+    restored: dict[str, "Job"] = {}
     try:
         keys = await r.keys(f"{REDIS_JOB_PREFIX}*")
         for key in keys:
@@ -217,15 +265,30 @@ async def _load_all_jobs_from_redis() -> dict[str, Job]:
     return restored
 
 
-async def _delete_job_from_redis(job_id: str) -> None:
-    """Remove a job from Redis."""
+# ── Unified save/load ─────────────────────────────────────────────────────────
+
+async def _save_job(job: "Job") -> None:
+    """Persist job — tries Redis first, falls back to file store."""
     r = await _get_redis()
-    if r is None:
-        return
-    try:
-        await r.delete(f"{REDIS_JOB_PREFIX}{job_id}")
-    except Exception as exc:
-        logger.warning(f"Redis delete failed for job {job_id}: {exc}")
+    if r is not None:
+        try:
+            await _save_job_redis(job)
+            return  # Redis OK, done
+        except Exception as exc:
+            logger.warning(f"Redis save failed for job {job.job_id}, falling back to file: {exc}")
+    # B-M3: fallback luôn chạy nếu Redis không available hoặc fail
+    await _flush_jobs_to_file()
+
+
+async def _load_all_jobs() -> dict[str, "Job"]:
+    """Load all jobs on startup — Redis takes priority over file store."""
+    r = await _get_redis()
+    if r is not None:
+        result = await _load_all_jobs_from_redis()
+        if result:
+            return result
+    # Fall back to file store
+    return _load_jobs_from_file()
 
 
 # In-memory job storage — also used as write-through cache when Redis is active
@@ -251,8 +314,8 @@ async def lifespan(app: FastAPI):
     # Initialize job queue and start worker
     job_queue = asyncio.Queue()
 
-    # Bug #2 fix: Restore jobs từ Redis trước khi start worker
-    restored = await _load_all_jobs_from_redis()
+    # Restore jobs từ file/Redis trước khi start worker
+    restored = await _load_all_jobs()
     jobs.update(restored)
 
     # Re-queue các jobs bị gián đoạn (QUEUED hoặc PROCESSING khi server restart).
@@ -297,9 +360,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="TRELLIS.2 API", version="1.0.0", lifespan=lifespan)
+
+# B-M6: CORS origins từ env var — set CORS_ORIGINS="https://your-domain.com" để restrict
+_cors_origins = os.environ.get("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -351,7 +417,9 @@ async def queue_status():
         remaining_on_current = 0.0
         if processing:
             current = processing[0]
-            elapsed = time.time() - (current.started_at or time.time())
+            # B-M4: dùng `is not None` thay vì `or` để tránh falsy 0.0
+            ref_time = current.started_at if current.started_at is not None else time.time()
+            elapsed = time.time() - ref_time
             remaining_on_current = max(0.0, _avg_generation_time - elapsed)
         estimated_wait = round(remaining_on_current + queued_count * _avg_generation_time, 1)
 
@@ -428,6 +496,7 @@ async def job_worker():
             job = jobs.get(job_id)
             if not job:
                 logger.error(f"Job {job_id} not found in storage")
+                job_queue.task_done()  # B-H1 fix: không để queue block mãi
                 continue
             
             async with processing_lock:
@@ -532,7 +601,11 @@ async def process_job(job: Job):
         meshes = await loop.run_in_executor(
             None, functools.partial(pipeline.run, image, **run_kwargs)
         )
-        
+
+        # B-M5: pipeline có thể trả list rỗng nếu ảnh quá tệ
+        if not meshes:
+            raise RuntimeError("Pipeline returned no meshes — check input image quality")
+
         job.message = "Processing mesh..."
         job.progress = 70.0
         await _save_job(job)
@@ -589,7 +662,8 @@ async def process_job(job: Job):
 @app.post("/generate", response_model=JobResponse)
 async def generate(request: GenerateRequest):
     """Create a new generation job and return job ID immediately."""
-    if pipeline is None:
+    # B-M1: check cả job_queue — lifespan có thể chưa hoàn thành init
+    if pipeline is None or job_queue is None:
         raise HTTPException(status_code=503, detail="Pipeline not ready")
     
     # Validate image

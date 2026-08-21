@@ -48,7 +48,6 @@ class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str = "ok"
-    backend: str = "cuda"
     weights_loaded: bool = False
 
 

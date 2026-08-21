@@ -80,3 +80,22 @@ class JobStatusResponse(BaseModel):
         default=None,
         description="Position in queue (1 = next to run). None when not queued."
     )
+
+
+class QueueStatusResponse(BaseModel):
+    """Public queue status — no authentication required.
+
+    Tells any visitor whether the server is busy and how many jobs are pending.
+    Used by clients that don't own a job (e.g. a second browser/machine) so
+    they can show a friendly 'busy' banner instead of letting the user try to
+    generate and get rejected.
+    """
+
+    busy: bool = Field(..., description="True when at least one job is processing or queued")
+    processing_count: int = Field(default=0, description="Number of jobs currently processing (0 or 1)")
+    queued_count: int = Field(default=0, description="Number of jobs waiting in queue")
+    total_active: int = Field(default=0, description="processing_count + queued_count")
+    estimated_wait_seconds: float | None = Field(
+        default=None,
+        description="Rough ETA in seconds based on average generation time. None if unknown.",
+    )

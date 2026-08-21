@@ -13,6 +13,7 @@ numpy
 opencv-python-headless
 pillow
 pygltflib
+redis[hiredis]>=5.0.0
 scipy
 safetensors
 timm

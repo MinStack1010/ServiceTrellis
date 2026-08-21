@@ -201,7 +201,7 @@ async def _save_job_redis(job: "Job") -> None:
         payload = json.dumps(_job_to_dict(job))
         ttl = REDIS_JOB_TTL if job.completed_at is not None else 0
         if ttl:
-            await r.setex(key, ttl, payload)
+            await r.set(key, payload, ex=ttl)
         else:
             await r.set(key, payload)
     except Exception as exc:
@@ -546,13 +546,25 @@ async def process_job(job: Job):
 
         del meshes
         gc.collect()
+        if torch.cuda.is_available():
+            # Offload pipeline weights to CPU to free VRAM for GLB export
+            pipeline.cpu()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("Pipeline offloaded to CPU — VRAM freed for GLB export")
 
         job.message = "Exporting & uploading GLB..."
         job.progress = 80.0
         await _save_job(job)
-        glb_url = await loop.run_in_executor(
-            None, functools.partial(_export_and_upload_glb, mesh, job.request, job.job_id)
-        )
+        try:
+            glb_url = await loop.run_in_executor(
+                None, functools.partial(_export_and_upload_glb, mesh, job.request, job.job_id)
+            )
+        finally:
+            # Always reload pipeline back to GPU regardless of export success/failure
+            if torch.cuda.is_available():
+                pipeline.cuda()
+                logger.info("Pipeline reloaded to GPU")
 
         job.message = "Finalizing..."
         job.progress = 95.0

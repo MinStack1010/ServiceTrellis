@@ -27,15 +27,6 @@ def end_session(req: gr.Request):
 
 
 def preprocess_image(image: Image.Image) -> Image.Image:
-    """
-    Preprocess the input image.
-
-    Args:
-        image (Image.Image): The input image.
-
-    Returns:
-        Image.Image: The preprocessed image.
-    """
     processed_image = pipeline.preprocess_image(image)
     return processed_image
 

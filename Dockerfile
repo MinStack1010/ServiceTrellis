@@ -1,9 +1,5 @@
-# Linux/CUDA image for the TRELLIS.2 API service.
-# Requires an NVIDIA GPU with 24 GB+ VRAM and NVIDIA Container Toolkit.
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
 
-# Cloud Build has no GPU. Compile CUDA extensions only for the VM's L4
-# (Ada, SM 8.9) instead of asking PyTorch to inspect a visible GPU.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -27,14 +23,11 @@ WORKDIR /app
 COPY requirements-service.txt ./
 RUN pip install --upgrade pip && pip install -r requirements-service.txt
 
-# Keep expensive CUDA-extension compilation in a stable layer. Normal edits to
-# api_server.py or Cloud Build files below will reuse this layer from :latest.
 COPY docker/install-extensions.sh ./docker/install-extensions.sh
 COPY o-voxel ./o-voxel
 RUN chmod +x docker/install-extensions.sh && docker/install-extensions.sh
 RUN python -c "import torch; assert torch.version.cuda == '12.4'; print(torch.__version__)" && pip check
 
-# Application code changes do not invalidate the cached dependency layers.
 COPY . .
 
 RUN mkdir -p /data/huggingface /app/tmp

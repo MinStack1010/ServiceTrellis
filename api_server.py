@@ -1,20 +1,3 @@
-"""
-FastAPI server for Microsoft TRELLIS.2 image-to-3D generation.
-
-Endpoints:
-    GET  /health         — server status
-    GET  /queue/status   — busy flag + ETA for waiting clients
-    POST /generate       — base64 image → job_id (rejected if server busy)
-    GET  /jobs/{job_id}  — poll job progress / result
-
-Environment variables:
-    REDIS_URL   — Redis connection URL (e.g. redis://localhost:6379/0).
-                  Falls back to file-based store if not set or unreachable.
-    GCS_BUCKET  — GCS bucket for GLB uploads (default: synode-trellis-iframe)
-    CORS_ORIGINS — comma-separated allowed origins (default: *)
-    PORT        — listening port (default: 8080)
-    TRELLIS2_MODEL — HuggingFace model id (default: microsoft/TRELLIS.2-4B)
-"""
 import argparse
 import asyncio
 import base64
@@ -71,11 +54,8 @@ PIPELINE_TYPE_MAP = {
     "1536": "1536_cascade",
     "1536_cascade": "1536_cascade",
 }
-
-# GCS bucket where generated GLB files are stored.
-# The bucket must have "allUsers → Storage Object Viewer" for public access.
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "synode-trellis-iframe")
-GCS_GLB_PREFIX = "generated"   # objects are stored as generated/{job_id}.glb
+GCS_GLB_PREFIX = "generated"
 
 pipeline: Trellis2ImageTo3DPipeline | None = None
 _gcs_client: gcs.Client | None = None
@@ -104,28 +84,23 @@ class Job:
     completed_at: Optional[float] = None
 
 
-# ─── Persistent Job Store ────────────────────────────────────────────────────
-# Job state is written to a JSON file on disk so it survives container restarts.
-# Optional Redis: set REDIS_URL env var to use Redis instead.
-# Falls back to file store if Redis is unreachable.
-
 JOB_STATE_PATH = os.environ.get("JOB_STATE_PATH", "/app/tmp/jobs.json")
 REDIS_URL = os.environ.get("REDIS_URL", "")
 REDIS_JOB_PREFIX = "trellis:job:"
-REDIS_JOB_TTL = 3600  # 1 hour TTL for completed/failed jobs in Redis
+REDIS_JOB_TTL = 3600
 
 try:
-    import redis.asyncio as aioredis  # type: ignore
+    import redis.asyncio as aioredis 
     _redis_available = True
 except ImportError:
     _redis_available = False
 
-_redis_client: "aioredis.Redis | None" = None  # type: ignore[name-defined]
+_redis_client: "aioredis.Redis | None" = None
 _redis_init_lock = asyncio.Lock()
 _file_store_lock = asyncio.Lock()
 
 
-async def _get_redis() -> "aioredis.Redis | None":  # type: ignore[name-defined]
+async def _get_redis() -> "aioredis.Redis | None":
     """Return a cached async Redis client, or None if Redis is unavailable."""
     global _redis_client
     if not _redis_available or not REDIS_URL:
@@ -135,7 +110,7 @@ async def _get_redis() -> "aioredis.Redis | None":  # type: ignore[name-defined]
     async with _redis_init_lock:
         if _redis_client is None:
             try:
-                _redis_client = aioredis.from_url(  # type: ignore[union-attr]
+                _redis_client = aioredis.from_url(
                     REDIS_URL,
                     decode_responses=True,
                     socket_connect_timeout=2,
@@ -180,8 +155,6 @@ def _dict_to_job(d: dict) -> "Job":
     )
 
 
-# ── File-based store ──────────────────────────────────────────────────────────
-
 def _write_jobs_file_sync(snapshot: dict) -> None:
     os.makedirs(os.path.dirname(JOB_STATE_PATH), exist_ok=True)
     tmp_path = JOB_STATE_PATH + ".tmp"
@@ -218,8 +191,6 @@ def _load_jobs_from_file() -> dict[str, "Job"]:
         logger.warning(f"Could not read job file ({exc}) — starting fresh")
         return {}
 
-
-# ── Redis store ───────────────────────────────────────────────────────────────
 
 async def _save_job_redis(job: "Job") -> None:
     r = await _get_redis()
@@ -259,8 +230,6 @@ async def _load_all_jobs_from_redis() -> dict[str, "Job"]:
     return restored
 
 
-# ── Unified save/load ─────────────────────────────────────────────────────────
-
 async def _save_job(job: "Job") -> None:
     """Persist job — tries Redis first, falls back to file store."""
     r = await _get_redis()
@@ -283,17 +252,14 @@ async def _load_all_jobs() -> dict[str, "Job"]:
     return _load_jobs_from_file()
 
 
-# ── In-memory state ───────────────────────────────────────────────────────────
-
 jobs: dict[str, Job] = {}
 job_queue: asyncio.Queue = None
 worker_task: asyncio.Task = None
 cleanup_task: asyncio.Task = None
 processing_lock = asyncio.Lock()
 
-JOB_TTL_SECONDS = 3600  # evict completed/failed jobs after 1 hour
+JOB_TTL_SECONDS = 3600
 
-# Exponential moving average of generation time — used by /queue/status ETA.
 _avg_generation_time: float = 120.0
 
 
@@ -304,8 +270,6 @@ def _is_busy() -> bool:
         for j in jobs.values()
     )
 
-
-# ── App lifespan ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -320,20 +284,18 @@ async def lifespan(app: FastAPI):
     restored = await _load_all_jobs()
     jobs.update(restored)
 
-    # Re-queue jobs interrupted by a restart (PROCESSING reset to QUEUED).
-    interrupted = sorted(
-        [j for j in jobs.values() if j.status in (JobStatus.QUEUED, JobStatus.PROCESSING)],
-        key=lambda j: j.created_at,
-    )
+    interrupted = [
+        j for j in jobs.values()
+        if j.status in (JobStatus.QUEUED, JobStatus.PROCESSING)
+    ]
     for j in interrupted:
-        if j.status == JobStatus.PROCESSING:
-            j.status = JobStatus.QUEUED
-            j.progress = 0.0
-            j.message = "Re-queued after server restart"
-            await _save_job(j)
-        await job_queue.put(j.job_id)
+        j.status = JobStatus.FAILED
+        j.error = "Server restarted — job was interrupted"
+        j.message = "Job cancelled due to server restart"
+        j.completed_at = time.time()
+        await _save_job(j)
     if interrupted:
-        logger.info(f"Re-queued {len(interrupted)} interrupted job(s) after restart")
+        logger.info(f"Cancelled {len(interrupted)} interrupted job(s) after restart")
 
     worker_task = asyncio.create_task(job_worker())
     cleanup_task = asyncio.create_task(job_cleanup_worker())
@@ -357,8 +319,6 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-
-# ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="TRELLIS.2 API", version="1.0.0", lifespan=lifespan)
 
@@ -428,14 +388,12 @@ async def generate(request: GenerateRequest):
     if pipeline is None or job_queue is None:
         raise HTTPException(status_code=503, detail="Pipeline not ready")
 
-    # Block duplicate jobs: only one job may be active at a time.
     if _is_busy():
         raise HTTPException(
             status_code=409,
             detail="Server is busy — a generation job is already running. Please wait for it to finish."
         )
 
-    # Validate image
     try:
         image_bytes = base64.b64decode(request.image)
         Image.open(io.BytesIO(image_bytes))
@@ -486,10 +444,7 @@ async def get_job_status(job_id: str):
     )
 
 
-# ── Workers ───────────────────────────────────────────────────────────────────
-
 async def job_worker():
-    """Process jobs one at a time."""
     while True:
         try:
             job_id = await job_queue.get()
@@ -509,7 +464,6 @@ async def job_worker():
 
 
 async def job_cleanup_worker():
-    """Evict completed/failed jobs older than JOB_TTL_SECONDS from memory."""
     while True:
         try:
             await asyncio.sleep(300)
@@ -531,7 +485,6 @@ async def job_cleanup_worker():
 
 
 async def process_job(job: Job):
-    """Run the full generation pipeline for one job."""
     global pipeline, _avg_generation_time
 
     job.status = JobStatus.PROCESSING
@@ -621,7 +574,6 @@ async def process_job(job: Job):
         job.completed_at = time.time()
         await _save_job(job)
 
-        # Update ETA estimate with exponential moving average
         _avg_generation_time = _avg_generation_time * 0.8 + generation_time * 0.2
         logger.info(f"Job {job.job_id} completed in {generation_time:.2f}s (avg: {_avg_generation_time:.1f}s)")
 
@@ -638,7 +590,6 @@ async def process_job(job: Job):
             logger.info(f"GPU cache cleared for job {job.job_id}")
 
 
-# ── GLB export + GCS upload ───────────────────────────────────────────────────
 
 def _export_and_upload_glb(mesh, request: GenerateRequest, job_id: str) -> str:
     """Export mesh to GLB, upload to GCS, return public URL."""
@@ -709,7 +660,6 @@ def _export_and_upload_glb(mesh, request: GenerateRequest, job_id: str) -> str:
             logger.info(f"Temporary file cleaned up: {glb_path}")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="TRELLIS.2 API Server")

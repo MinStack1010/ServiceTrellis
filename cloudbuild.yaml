@@ -1,17 +1,8 @@
-# GitHub main -> Cloud Build -> Artifact Registry -> IAP -> G2 GPU VM.
-# This file is at the root of the ServiceTrellis GitHub repository.
-# The VM only needs the NVIDIA driver, Docker, gcloud, and NVIDIA Container
-# Toolkit. CUDA, PyTorch, TRELLIS.2, and all CUDA extensions are in the image.
-
 steps:
-  # o-voxel depends on Eigen, stored as a Git submodule. Cloud Build source
-  # checkouts do not guarantee recursive submodules, so initialize it here.
   - id: initialize-submodules
     name: gcr.io/cloud-builders/git
     args: [submodule, update, --init, --recursive]
 
-  # Cloud Build workers are ephemeral. Pull the previously successful image so
-  # Docker can reuse the CUDA-extension layers on later commits.
   - id: pull-build-cache
     name: gcr.io/cloud-builders/docker
     entrypoint: bash

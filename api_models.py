@@ -18,7 +18,6 @@ class GenerateRequest(BaseModel):
     )
     texture_size: int = Field(default=2048, ge=512, le=4096, description="Texture resolution")
 
-    # These defaults and ranges match the official TRELLIS.2 image-to-3D UI.
     ss_guidance_strength: float = Field(default=7.5, ge=1, le=10)
     ss_guidance_rescale: float = Field(default=0.7, ge=0, le=1)
     ss_sampling_steps: int = Field(default=12, ge=1, le=50)
@@ -45,7 +44,6 @@ class GenerateResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Health check response."""
 
     status: str = "ok"
     weights_loaded: bool = False
@@ -60,14 +58,12 @@ class JobStatus(str, Enum):
 
 
 class JobResponse(BaseModel):
-    """Response for job creation."""
 
     job_id: str = Field(..., description="Unique job identifier")
     status: JobStatus = Field(..., description="Current job status")
 
 
 class JobStatusResponse(BaseModel):
-    """Response for job status check."""
 
     job_id: str = Field(..., description="Unique job identifier")
     status: JobStatus = Field(..., description="Current job status")
@@ -82,13 +78,6 @@ class JobStatusResponse(BaseModel):
 
 
 class QueueStatusResponse(BaseModel):
-    """Public queue status — no authentication required.
-
-    Tells any visitor whether the server is busy and how many jobs are pending.
-    Used by clients that don't own a job (e.g. a second browser/machine) so
-    they can show a friendly 'busy' banner instead of letting the user try to
-    generate and get rejected.
-    """
 
     busy: bool = Field(..., description="True when at least one job is processing or queued")
     processing_count: int = Field(default=0, description="Number of jobs currently processing (0 or 1)")

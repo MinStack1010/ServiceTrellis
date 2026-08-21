@@ -501,6 +501,7 @@ async def process_job(job: Job):
         job.progress = 5.0
         image_bytes = base64.b64decode(job.request.image)
         image = Image.open(io.BytesIO(image_bytes))
+        del image_bytes  # free base64 buffer early
 
         pipeline_type = PIPELINE_TYPE_MAP.get(job.request.pipeline_type, job.request.pipeline_type)
 
@@ -508,35 +509,125 @@ async def process_job(job: Job):
         job.progress = 10.0
         await _save_job(job)
 
-        run_kwargs = dict(
-            seed=job.request.seed,
-            preprocess_image=True,
-            pipeline_type=pipeline_type,
-            sparse_structure_sampler_params={
-                "steps": job.request.ss_sampling_steps,
-                "guidance_strength": job.request.ss_guidance_strength,
-                "guidance_rescale": job.request.ss_guidance_rescale,
-                "rescale_t": job.request.ss_rescale_t,
-            },
-            shape_slat_sampler_params={
-                "steps": job.request.shape_slat_sampling_steps,
-                "guidance_strength": job.request.shape_slat_guidance_strength,
-                "guidance_rescale": job.request.shape_slat_guidance_rescale,
-                "rescale_t": job.request.shape_slat_rescale_t,
-            },
-            tex_slat_sampler_params={
-                "steps": job.request.tex_slat_sampling_steps,
-                "guidance_strength": job.request.tex_slat_guidance_strength,
-                "guidance_rescale": job.request.tex_slat_guidance_rescale,
-                "rescale_t": job.request.tex_slat_rescale_t,
-            },
-        )
-        meshes = await loop.run_in_executor(
-            None, functools.partial(pipeline.run, image, **run_kwargs)
-        )
+        sparse_structure_sampler_params = {
+            "steps": job.request.ss_sampling_steps,
+            "guidance_strength": job.request.ss_guidance_strength,
+            "guidance_rescale": job.request.ss_guidance_rescale,
+            "rescale_t": job.request.ss_rescale_t,
+        }
+        shape_slat_sampler_params = {
+            "steps": job.request.shape_slat_sampling_steps,
+            "guidance_strength": job.request.shape_slat_guidance_strength,
+            "guidance_rescale": job.request.shape_slat_guidance_rescale,
+            "rescale_t": job.request.shape_slat_rescale_t,
+        }
+        tex_slat_sampler_params = {
+            "steps": job.request.tex_slat_sampling_steps,
+            "guidance_strength": job.request.tex_slat_guidance_strength,
+            "guidance_rescale": job.request.tex_slat_guidance_rescale,
+            "rescale_t": job.request.tex_slat_rescale_t,
+        }
 
-        if not meshes:
-            raise RuntimeError("Pipeline returned no meshes — check input image quality")
+        # ── Stage 1: Sparse structure ────────────────────────────────────────
+        def _run_sparse():
+            proc_img = pipeline.preprocess_image(image)
+            torch.manual_seed(job.request.seed)
+            cond_512 = pipeline.get_cond([proc_img], 512)
+            cond_1024 = pipeline.get_cond([proc_img], 1024) if pipeline_type != "512" else None
+            ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
+            coords = pipeline.sample_sparse_structure(
+                cond_512, ss_res, 1, sparse_structure_sampler_params
+            )
+            return cond_512, cond_1024, coords
+
+        try:
+            cond_512, cond_1024, coords = await loop.run_in_executor(None, _run_sparse)
+        except AttributeError:
+            # Pipeline doesn't expose step-by-step API — fall back to full run
+            run_kwargs = dict(
+                seed=job.request.seed,
+                preprocess_image=True,
+                pipeline_type=pipeline_type,
+                sparse_structure_sampler_params=sparse_structure_sampler_params,
+                shape_slat_sampler_params=shape_slat_sampler_params,
+                tex_slat_sampler_params=tex_slat_sampler_params,
+            )
+            meshes = await loop.run_in_executor(
+                None, functools.partial(pipeline.run, image, **run_kwargs)
+            )
+            if not meshes:
+                raise RuntimeError("Pipeline returned no meshes — check input image quality")
+        else:
+            # ── Stage 2: Shape SLat ──────────────────────────────────────────
+            job.message = "Generating 3D shape..."
+            job.progress = 25.0
+            await _save_job(job)
+
+            def _run_shape():
+                if pipeline_type == "512":
+                    shape_slat = pipeline.sample_shape_slat(
+                        cond_512, pipeline.models["shape_slat_flow_model_512"],
+                        coords, shape_slat_sampler_params,
+                    )
+                    resolution = 512
+                elif pipeline_type == "1024":
+                    shape_slat = pipeline.sample_shape_slat(
+                        cond_1024, pipeline.models["shape_slat_flow_model_1024"],
+                        coords, shape_slat_sampler_params,
+                    )
+                    resolution = 1024
+                elif pipeline_type == "1024_cascade":
+                    shape_slat, resolution = pipeline.sample_shape_slat_cascade(
+                        cond_512, cond_1024,
+                        pipeline.models["shape_slat_flow_model_512"],
+                        pipeline.models["shape_slat_flow_model_1024"],
+                        512, 1024,
+                        coords, shape_slat_sampler_params,
+                    )
+                else:  # 1536_cascade
+                    shape_slat, resolution = pipeline.sample_shape_slat_cascade(
+                        cond_512, cond_1024,
+                        pipeline.models["shape_slat_flow_model_512"],
+                        pipeline.models["shape_slat_flow_model_1024"],
+                        512, 1536,
+                        coords, shape_slat_sampler_params,
+                    )
+                return shape_slat, resolution
+
+            shape_slat, resolution = await loop.run_in_executor(None, _run_shape)
+
+            # ── Stage 3: Texture SLat ────────────────────────────────────────
+            job.message = "Generating texture..."
+            job.progress = 50.0
+            await _save_job(job)
+
+            def _run_texture():
+                if pipeline_type == "512":
+                    flow_model = pipeline.models["tex_slat_flow_model_512"]
+                else:
+                    flow_model = pipeline.models["tex_slat_flow_model_1024"]
+                tex_slat = pipeline.sample_tex_slat(
+                    cond_1024 if cond_1024 is not None else cond_512,
+                    flow_model,
+                    shape_slat,
+                    tex_slat_sampler_params,
+                )
+                return tex_slat
+
+            tex_slat = await loop.run_in_executor(None, _run_texture)
+
+            # ── Stage 4: Decode ──────────────────────────────────────────────
+            job.message = "Decoding mesh & texture..."
+            job.progress = 65.0
+            await _save_job(job)
+
+            def _run_decode():
+                return pipeline.decode_latent(shape_slat, tex_slat, resolution)
+
+            meshes = await loop.run_in_executor(None, _run_decode)
+
+            if not meshes:
+                raise RuntimeError("Pipeline returned no meshes — check input image quality")
 
         job.message = "Processing mesh..."
         job.progress = 70.0

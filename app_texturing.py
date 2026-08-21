@@ -32,9 +32,6 @@ def preprocess_image(image: Image.Image) -> Image.Image:
 
 
 def get_seed(randomize_seed: bool, seed: int) -> int:
-    """
-    Get the random seed.
-    """
     return np.random.randint(0, MAX_SEED) if randomize_seed else seed
 
 

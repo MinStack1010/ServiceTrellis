@@ -402,7 +402,17 @@ async def get_job_status(job_id: str):
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
+    # Calculate queue position: count how many QUEUED jobs were created before this one.
+    # Position 1 means this job is next to run.
+    queue_position: int | None = None
+    if job.status == JobStatus.QUEUED:
+        earlier_queued = sum(
+            1 for j in jobs.values()
+            if j.status == JobStatus.QUEUED and j.created_at < job.created_at
+        )
+        queue_position = earlier_queued + 1
+
     return JobStatusResponse(
         job_id=job.job_id,
         status=job.status,
@@ -410,6 +420,7 @@ async def get_job_status(job_id: str):
         message=job.message,
         result=job.result,
         error=job.error,
+        queue_position=queue_position,
     )
 
 

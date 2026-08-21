@@ -557,7 +557,6 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             with gr.Walkthrough(selected=0) as walkthrough:
                 with gr.Step("Preview", id=0):
                     preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
-                    extract_btn = gr.Button("Extract GLB")
                 with gr.Step("Extract", id=1):
                     glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
                     download_btn = gr.DownloadButton(label="Download GLB")
@@ -605,13 +604,13 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         outputs=[output_buf, preview_output],
     )
     
-    extract_btn.click(
-        lambda: gr.Walkthrough(selected=1), outputs=walkthrough
-    ).then(
-        extract_glb,
-        inputs=[output_buf, decimation_target, texture_size],
-        outputs=[glb_output, download_btn],
-    )
+    # extract_btn.click(
+    #     lambda: gr.Walkthrough(selected=1), outputs=walkthrough
+    # ).then(
+    #     extract_glb,
+    #     inputs=[output_buf, decimation_target, texture_size],
+    #     outputs=[glb_output, download_btn],
+    # )
         
 
 # Launch the Gradio app

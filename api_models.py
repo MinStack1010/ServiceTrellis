@@ -76,3 +76,7 @@ class JobStatusResponse(BaseModel):
     message: str = Field(default="", description="Status message")
     result: GenerateResponse | None = Field(default=None, description="Generation result when completed")
     error: str = Field(default="", description="Error message when failed")
+    queue_position: int | None = Field(
+        default=None,
+        description="Position in queue (1 = next to run). None when not queued."
+    )

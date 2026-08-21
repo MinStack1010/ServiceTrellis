@@ -16,10 +16,12 @@ import argparse
 import asyncio
 import base64
 import functools
+import gc
 import io
 import json
 import logging
 import os
+import signal
 import tempfile
 import time
 import traceback
@@ -152,11 +154,11 @@ def _job_to_dict(job: "Job") -> dict:
     """Serialize Job to a JSON-safe dict."""
     return {
         "job_id": job.job_id,
-        "request": job.request.dict(),
+        "request": job.request.model_dump(),
         "status": job.status.value,
         "progress": job.progress,
         "message": job.message,
-        "result": job.result.dict() if job.result else None,
+        "result": job.result.model_dump() if job.result else None,
         "error": job.error,
         "created_at": job.created_at,
         "started_at": job.started_at,
@@ -439,6 +441,15 @@ def _export_and_upload_glb(mesh, request: GenerateRequest, job_id: str) -> str:
     The temporary local file is always cleaned up before returning.
     """
     logger.info("Starting GLB export...")
+
+    # Giải phóng GPU cache và Python heap trước khi export để tránh OOM.
+    # Pipeline đã xong → CUDA tensors trung gian không cần nữa.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+    logger.info("Memory freed before GLB export")
+
     try:
         glb = o_voxel.postprocess.to_glb(
             vertices=mesh.vertices,
@@ -454,6 +465,13 @@ def _export_and_upload_glb(mesh, request: GenerateRequest, job_id: str) -> str:
             verbose=False,
         )
         logger.info("GLB object created successfully")
+    except MemoryError:
+        # OOM trên CPU heap — xảy ra khi texture_size hoặc decimation_target quá lớn
+        logger.error("OOM during GLB creation — try reducing texture size or decimation target")
+        raise MemoryError(
+            "Not enough RAM to export this model. "
+            "Try reducing Texture size (e.g. 1024 px) or GLB decimation target."
+        )
     except Exception as exc:
         logger.error(f"GLB object creation failed: {exc}")
         logger.error(f"Traceback:\n{traceback.format_exc()}")
@@ -467,6 +485,10 @@ def _export_and_upload_glb(mesh, request: GenerateRequest, job_id: str) -> str:
         glb.export(glb_path, extension_webp=True)
         logger.info("GLB export to file successful")
 
+        # Giải phóng GLB object khỏi RAM ngay sau khi đã ghi file
+        del glb
+        gc.collect()
+
         # Upload to GCS
         object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
         bucket = _get_gcs_client().bucket(GCS_BUCKET)
@@ -478,6 +500,12 @@ def _export_and_upload_glb(mesh, request: GenerateRequest, job_id: str) -> str:
         logger.info(f"GLB uploaded to GCS: {public_url}")
         return public_url
 
+    except MemoryError:
+        logger.error("OOM during GLB file export")
+        raise MemoryError(
+            "Not enough RAM to write the GLB file. "
+            "Try reducing Texture size (e.g. 1024 px) or GLB decimation target."
+        )
     except Exception as exc:
         logger.error(f"GLB export/upload failed: {exc}")
         logger.error(f"Traceback:\n{traceback.format_exc()}")
@@ -611,17 +639,21 @@ async def process_job(job: Job):
         await _save_job(job)
         mesh = meshes[0]
         await loop.run_in_executor(None, functools.partial(mesh.simplify, 16777216))
-        
+
+        # Giải phóng meshes list (chỉ giữ mesh[0]) để tiết kiệm RAM trước export
+        del meshes
+        gc.collect()
+
         job.message = "Exporting & uploading GLB..."
         job.progress = 80.0
         await _save_job(job)
         glb_url = await loop.run_in_executor(
             None, functools.partial(_export_and_upload_glb, mesh, job.request, job.job_id)
         )
-        
+
         job.message = "Finalizing..."
         job.progress = 95.0
-        
+
         generation_time = time.time() - job.started_at
         job.result = GenerateResponse(
             glb_url=glb_url,
@@ -629,6 +661,10 @@ async def process_job(job: Job):
             faces=int(mesh.faces.shape[0]),
             generation_time=round(generation_time, 2),
         )
+
+        # Mesh không cần nữa sau khi đã lấy thông tin
+        del mesh
+        gc.collect()
         
         job.status = JobStatus.COMPLETED
         job.progress = 100.0

@@ -271,13 +271,40 @@ def _is_busy() -> bool:
     )
 
 
+def _model_to_gpu(model_key: str) -> None:
+    """Move a single pipeline sub-model to CUDA and clear the cache."""
+    if torch.cuda.is_available() and pipeline is not None:
+        m = pipeline.models.get(model_key)
+        if m is not None:
+            m.cuda()
+            logger.debug(f"[stage] {model_key} → GPU")
+
+
+def _model_to_cpu(model_key: str) -> None:
+    """Move a single pipeline sub-model back to CPU and free VRAM."""
+    if pipeline is not None:
+        m = pipeline.models.get(model_key)
+        if m is not None:
+            m.cpu()
+            logger.debug(f"[stage] {model_key} → CPU")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pipeline, job_queue, worker_task, cleanup_task
 
     model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
+    # Load weights into CPU RAM only — do NOT call pipeline.cuda() here.
+    # Each processing stage will move only the models it needs to GPU and
+    # immediately release them afterwards (per-stage loading).  This keeps
+    # peak VRAM well within the 24 GB L4 budget and prevents OOM crashes
+    # when the entire ~14 GB pipeline is live on the GPU simultaneously.
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
-    pipeline.cuda()
+    # Ensure all sub-models start on CPU
+    pipeline.cpu()
+    logger.info("Pipeline loaded into CPU RAM (per-stage GPU loading enabled)")
 
     job_queue = asyncio.Queue()
 
@@ -342,7 +369,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    if pipeline is None:
+    # Pipeline is ready when it has been loaded into CPU RAM (models dict populated).
+    # We no longer require it to be on GPU at rest — models are moved per-stage.
+    ready = pipeline is not None and bool(getattr(pipeline, "models", None))
+    if not ready:
         return HealthResponse(status="loading", weights_loaded=False)
     return HealthResponse(status="ok", weights_loaded=True)
 
@@ -528,101 +558,156 @@ async def process_job(job: Job):
             "rescale_t": job.request.tex_slat_rescale_t,
         }
 
-        # ── Stage 1: Sparse structure ────────────────────────────────────────
+        # ── Stage 1: Conditioning (DinoV3) ──────────────────────────────────
+        # Models needed: image_cond_model (DinoV3)
         def _run_sparse():
-            proc_img = pipeline.preprocess_image(image)
-            torch.manual_seed(job.request.seed)
-            cond_512 = pipeline.get_cond([proc_img], 512)
-            cond_1024 = pipeline.get_cond([proc_img], 1024) if pipeline_type != "512" else None
-            ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
-            coords = pipeline.sample_sparse_structure(
-                cond_512, ss_res, 1, sparse_structure_sampler_params
-            )
+            _model_to_gpu("image_cond_model")
+            try:
+                proc_img = pipeline.preprocess_image(image)
+                torch.manual_seed(job.request.seed)
+                cond_512 = pipeline.get_cond([proc_img], 512)
+                cond_1024 = pipeline.get_cond([proc_img], 1024) if pipeline_type != "512" else None
+            finally:
+                _model_to_cpu("image_cond_model")
+
+            # Sparse structure flow — needs: sparse_structure_flow_model + sparse_structure_decoder
+            _model_to_gpu("sparse_structure_flow_model")
+            _model_to_gpu("sparse_structure_decoder")
+            try:
+                ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
+                coords = pipeline.sample_sparse_structure(
+                    cond_512, ss_res, 1, sparse_structure_sampler_params
+                )
+            finally:
+                _model_to_cpu("sparse_structure_flow_model")
+                _model_to_cpu("sparse_structure_decoder")
+
             return cond_512, cond_1024, coords
 
         try:
             cond_512, cond_1024, coords = await loop.run_in_executor(None, _run_sparse)
         except AttributeError:
             # Pipeline doesn't expose step-by-step API — fall back to full run
-            run_kwargs = dict(
-                seed=job.request.seed,
-                preprocess_image=True,
-                pipeline_type=pipeline_type,
-                sparse_structure_sampler_params=sparse_structure_sampler_params,
-                shape_slat_sampler_params=shape_slat_sampler_params,
-                tex_slat_sampler_params=tex_slat_sampler_params,
-            )
-            meshes = await loop.run_in_executor(
-                None, functools.partial(pipeline.run, image, **run_kwargs)
-            )
+            # Move all models to GPU for legacy path, then clean up afterward
+            pipeline.cuda()
+            try:
+                run_kwargs = dict(
+                    seed=job.request.seed,
+                    preprocess_image=True,
+                    pipeline_type=pipeline_type,
+                    sparse_structure_sampler_params=sparse_structure_sampler_params,
+                    shape_slat_sampler_params=shape_slat_sampler_params,
+                    tex_slat_sampler_params=tex_slat_sampler_params,
+                )
+                meshes = await loop.run_in_executor(
+                    None, functools.partial(pipeline.run, image, **run_kwargs)
+                )
+            finally:
+                pipeline.cpu()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             if not meshes:
                 raise RuntimeError("Pipeline returned no meshes — check input image quality")
         else:
             # ── Stage 2: Shape SLat ──────────────────────────────────────────
+            # Models needed: shape_slat_flow_model_{512,1024}
             job.message = "Generating 3D shape..."
             job.progress = 25.0
             await _save_job(job)
 
             def _run_shape():
                 if pipeline_type == "512":
-                    shape_slat = pipeline.sample_shape_slat(
-                        cond_512, pipeline.models["shape_slat_flow_model_512"],
-                        coords, shape_slat_sampler_params,
-                    )
+                    _model_to_gpu("shape_slat_flow_model_512")
+                    try:
+                        shape_slat = pipeline.sample_shape_slat(
+                            cond_512, pipeline.models["shape_slat_flow_model_512"],
+                            coords, shape_slat_sampler_params,
+                        )
+                    finally:
+                        _model_to_cpu("shape_slat_flow_model_512")
                     resolution = 512
                 elif pipeline_type == "1024":
-                    shape_slat = pipeline.sample_shape_slat(
-                        cond_1024, pipeline.models["shape_slat_flow_model_1024"],
-                        coords, shape_slat_sampler_params,
-                    )
+                    _model_to_gpu("shape_slat_flow_model_1024")
+                    try:
+                        shape_slat = pipeline.sample_shape_slat(
+                            cond_1024, pipeline.models["shape_slat_flow_model_1024"],
+                            coords, shape_slat_sampler_params,
+                        )
+                    finally:
+                        _model_to_cpu("shape_slat_flow_model_1024")
                     resolution = 1024
                 elif pipeline_type == "1024_cascade":
-                    shape_slat, resolution = pipeline.sample_shape_slat_cascade(
-                        cond_512, cond_1024,
-                        pipeline.models["shape_slat_flow_model_512"],
-                        pipeline.models["shape_slat_flow_model_1024"],
-                        512, 1024,
-                        coords, shape_slat_sampler_params,
-                    )
+                    _model_to_gpu("shape_slat_flow_model_512")
+                    _model_to_gpu("shape_slat_flow_model_1024")
+                    try:
+                        shape_slat, resolution = pipeline.sample_shape_slat_cascade(
+                            cond_512, cond_1024,
+                            pipeline.models["shape_slat_flow_model_512"],
+                            pipeline.models["shape_slat_flow_model_1024"],
+                            512, 1024,
+                            coords, shape_slat_sampler_params,
+                        )
+                    finally:
+                        _model_to_cpu("shape_slat_flow_model_512")
+                        _model_to_cpu("shape_slat_flow_model_1024")
                 else:  # 1536_cascade
-                    shape_slat, resolution = pipeline.sample_shape_slat_cascade(
-                        cond_512, cond_1024,
-                        pipeline.models["shape_slat_flow_model_512"],
-                        pipeline.models["shape_slat_flow_model_1024"],
-                        512, 1536,
-                        coords, shape_slat_sampler_params,
-                    )
+                    _model_to_gpu("shape_slat_flow_model_512")
+                    _model_to_gpu("shape_slat_flow_model_1024")
+                    try:
+                        shape_slat, resolution = pipeline.sample_shape_slat_cascade(
+                            cond_512, cond_1024,
+                            pipeline.models["shape_slat_flow_model_512"],
+                            pipeline.models["shape_slat_flow_model_1024"],
+                            512, 1536,
+                            coords, shape_slat_sampler_params,
+                        )
+                    finally:
+                        _model_to_cpu("shape_slat_flow_model_512")
+                        _model_to_cpu("shape_slat_flow_model_1024")
                 return shape_slat, resolution
 
             shape_slat, resolution = await loop.run_in_executor(None, _run_shape)
 
             # ── Stage 3: Texture SLat ────────────────────────────────────────
+            # Models needed: tex_slat_flow_model_{512,1024}
             job.message = "Generating texture..."
             job.progress = 50.0
             await _save_job(job)
 
             def _run_texture():
                 if pipeline_type == "512":
-                    flow_model = pipeline.models["tex_slat_flow_model_512"]
+                    model_key = "tex_slat_flow_model_512"
                 else:
-                    flow_model = pipeline.models["tex_slat_flow_model_1024"]
-                tex_slat = pipeline.sample_tex_slat(
-                    cond_1024 if cond_1024 is not None else cond_512,
-                    flow_model,
-                    shape_slat,
-                    tex_slat_sampler_params,
-                )
+                    model_key = "tex_slat_flow_model_1024"
+                _model_to_gpu(model_key)
+                try:
+                    tex_slat = pipeline.sample_tex_slat(
+                        cond_1024 if cond_1024 is not None else cond_512,
+                        pipeline.models[model_key],
+                        shape_slat,
+                        tex_slat_sampler_params,
+                    )
+                finally:
+                    _model_to_cpu(model_key)
                 return tex_slat
 
             tex_slat = await loop.run_in_executor(None, _run_texture)
 
             # ── Stage 4: Decode ──────────────────────────────────────────────
+            # Models needed: shape_slat_decoder + tex_slat_decoder
             job.message = "Decoding mesh & texture..."
             job.progress = 65.0
             await _save_job(job)
 
             def _run_decode():
-                return pipeline.decode_latent(shape_slat, tex_slat, resolution)
+                _model_to_gpu("shape_slat_decoder")
+                _model_to_gpu("tex_slat_decoder")
+                try:
+                    return pipeline.decode_latent(shape_slat, tex_slat, resolution)
+                finally:
+                    _model_to_cpu("shape_slat_decoder")
+                    _model_to_cpu("tex_slat_decoder")
 
             meshes = await loop.run_in_executor(None, _run_decode)
 
@@ -638,24 +723,17 @@ async def process_job(job: Job):
         del meshes
         gc.collect()
         if torch.cuda.is_available():
-            # Offload pipeline weights to CPU to free VRAM for GLB export
-            pipeline.cpu()
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            logger.info("Pipeline offloaded to CPU — VRAM freed for GLB export")
+            logger.info("VRAM cleared — all models are on CPU, ready for GLB export")
 
         job.message = "Exporting & uploading GLB..."
         job.progress = 80.0
         await _save_job(job)
-        try:
-            glb_url = await loop.run_in_executor(
-                None, functools.partial(_export_and_upload_glb, mesh, job.request, job.job_id)
-            )
-        finally:
-            # Always reload pipeline back to GPU regardless of export success/failure
-            if torch.cuda.is_available():
-                pipeline.cuda()
-                logger.info("Pipeline reloaded to GPU")
+        # No finally reload needed — models are already on CPU (per-stage loading)
+        glb_url = await loop.run_in_executor(
+            None, functools.partial(_export_and_upload_glb, mesh, job.request, job.job_id)
+        )
 
         job.message = "Finalizing..."
         job.progress = 95.0

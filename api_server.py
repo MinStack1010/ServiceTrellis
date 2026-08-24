@@ -558,17 +558,34 @@ async def process_job(job: Job):
             "rescale_t": job.request.tex_slat_rescale_t,
         }
 
-        # ── Stage 1: Conditioning (DinoV3) ──────────────────────────────────
-        # Models needed: image_cond_model (DinoV3)
+        # ── Stage 1: Conditioning (DinoV3) + background removal (BiRefNet) ─
+        # rembg_model and image_cond_model live outside pipeline.models dict,
+        # so we move them manually and set pipeline._device so preprocess_image
+        # uses the correct device (it calls self.rembg_model.to(self.device)).
         def _run_sparse():
-            _model_to_gpu("image_cond_model")
+            cuda_device = torch.device("cuda")
+            # Move rembg (BiRefNet) to GPU
+            if pipeline.rembg_model is not None:
+                pipeline.rembg_model.to(cuda_device)
+            # Move image_cond_model (DinoV3) to GPU
+            if pipeline.image_cond_model is not None:
+                pipeline.image_cond_model.to(cuda_device)
+            # Tell pipeline its current device so low_vram path works correctly
+            pipeline._device = cuda_device
             try:
                 proc_img = pipeline.preprocess_image(image)
                 torch.manual_seed(job.request.seed)
                 cond_512 = pipeline.get_cond([proc_img], 512)
                 cond_1024 = pipeline.get_cond([proc_img], 1024) if pipeline_type != "512" else None
             finally:
-                _model_to_cpu("image_cond_model")
+                # Return rembg + image_cond_model to CPU
+                if pipeline.rembg_model is not None:
+                    pipeline.rembg_model.cpu()
+                if pipeline.image_cond_model is not None:
+                    pipeline.image_cond_model.cpu()
+                pipeline._device = torch.device("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # Sparse structure flow — needs: sparse_structure_flow_model + sparse_structure_decoder
             _model_to_gpu("sparse_structure_flow_model")

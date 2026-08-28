@@ -1,4 +1,5 @@
 # PyTorch is supplied by the CUDA base image in Dockerfile.
+aiohttp
 fastapi
 uvicorn[standard]
 pydantic

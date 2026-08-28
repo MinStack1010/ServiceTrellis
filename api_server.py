@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import time
 import traceback
@@ -201,12 +202,8 @@ async def _save_job_redis(job: "Job") -> None:
 	try:
 		payload = json.dumps(_job_to_dict(job))
 		if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
-			# Terminal states: expire after TTL so Redis doesn't accumulate stale keys
 			ttl = REDIS_JOB_TTL
 		else:
-			# Active jobs (QUEUED / PROCESSING): keep a generous safety TTL so a
-			# crashed server never leaves immortal keys in Redis.
-			# 4 h covers the longest possible generation + any restart delay.
 			ttl = REDIS_JOB_TTL * 4
 		await r.set(key, payload, ex=ttl)
 	except Exception as exc:
@@ -236,7 +233,6 @@ async def _load_all_jobs_from_redis() -> dict[str, "Job"]:
 
 
 async def _save_job(job: "Job") -> None:
-	"""Persist job — tries Redis first, falls back to file store."""
 	r = await _get_redis()
 	if r is not None:
 		try:
@@ -248,7 +244,6 @@ async def _save_job(job: "Job") -> None:
 
 
 async def _load_all_jobs() -> dict[str, "Job"]:
-	"""Load all jobs on startup — Redis takes priority over file store."""
 	r = await _get_redis()
 	if r is not None:
 		result = await _load_all_jobs_from_redis()
@@ -269,7 +264,6 @@ _avg_generation_time: float = 120.0
 
 
 def _is_busy() -> bool:
-	"""Return True when a job is processing or queued."""
 	return any(
 		j.status in (JobStatus.PROCESSING, JobStatus.QUEUED)
 		for j in jobs.values()
@@ -277,7 +271,6 @@ def _is_busy() -> bool:
 
 
 def _model_to_gpu(model_key: str) -> None:
-	"""Move a single pipeline sub-model to CUDA and clear the cache."""
 	if torch.cuda.is_available() and pipeline is not None:
 		m = pipeline.models.get(model_key)
 		if m is not None:
@@ -286,7 +279,6 @@ def _model_to_gpu(model_key: str) -> None:
 
 
 def _model_to_cpu(model_key: str) -> None:
-	"""Move a single pipeline sub-model back to CPU and free VRAM."""
 	if pipeline is not None:
 		m = pipeline.models.get(model_key)
 		if m is not None:
@@ -301,13 +293,8 @@ async def lifespan(app: FastAPI):
 	global pipeline, job_queue, worker_task, cleanup_task
 
 	model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
-	# Load weights into CPU RAM only — do NOT call pipeline.cuda() here.
-	# Each processing stage will move only the models it needs to GPU and
-	# immediately release them afterwards (per-stage loading).  This keeps
-	# peak VRAM well within the 24 GB L4 budget and prevents OOM crashes
-	# when the entire ~14 GB pipeline is live on the GPU simultaneously.
+	
 	pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
-	# Ensure all sub-models start on CPU
 	pipeline.cpu()
 	logger.info("Pipeline loaded into CPU RAM (per-stage GPU loading enabled)")
 
@@ -362,7 +349,6 @@ app.add_middleware(
 	allow_headers=["*"],
 )
 
-# ── Bot/scanner filter ───────────────────────────────────────────────────────
 _BLOCKED_PREFIXES = (
 	"/.env", "/.git", "/.aws", "/.docker",
 	"/wp-", "/phpinfo", "/info.php",
@@ -892,6 +878,135 @@ def _export_and_upload_glb(
 			os.unlink(glb_path)
 			logger.info(f"Temporary file cleaned up: {glb_path}")
 
+
+# FBX export cache
+_fbx_cache: dict[str, str] = {}  # glb_url -> fbx_url
+_FBX_CACHE_TTL = 3600  # 1 hour
+
+
+def _get_fbx_cache_key(glb_url: str) -> str:
+	"""Generate cache key from GLB URL."""
+	return glb_url
+
+
+async def _convert_glb_to_fbx(glb_url: str) -> str:
+	"""Convert GLB to FBX using Blender script."""
+	
+	# Check cache first
+	cache_key = _get_fbx_cache_key(glb_url)
+	if cache_key in _fbx_cache:
+		cached_fbx_url = _fbx_cache[cache_key]
+		# Verify cached URL is still valid
+		try:
+			import aiohttp
+			async with aiohttp.ClientSession() as session:
+				async with session.head(cached_fbx_url) as resp:
+					if resp.status == 200:
+						logger.info(f"FBX cache hit for {glb_url}")
+						return cached_fbx_url
+		except Exception:
+			logger.warning(f"Cached FBX URL invalid, regenerating")
+			del _fbx_cache[cache_key]
+	
+	logger.info(f"Converting GLB to FBX: {glb_url}")
+	
+	# Download GLB file
+	loop = asyncio.get_event_loop()
+	
+	with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as glb_tmp:
+		glb_path = glb_tmp.name
+	
+	try:
+		# Download GLB from URL
+		import aiohttp
+		async with aiohttp.ClientSession() as session:
+			async with session.get(glb_url) as resp:
+				if resp.status != 200:
+					raise HTTPException(status_code=400, detail=f"Failed to download GLB: HTTP {resp.status}")
+				glb_content = await resp.read()
+		
+		with open(glb_path, "wb") as f:
+			f.write(glb_content)
+		
+		# Create output path for FBX
+		fbx_path = glb_path.replace(".glb", ".fbx")
+		
+		# Run Blender conversion script
+		blender_script_path = os.path.join(os.path.dirname(__file__), "blender_glb_to_fbx.py")
+		
+		if not os.path.exists(blender_script_path):
+			raise HTTPException(status_code=500, detail="Blender conversion script not found")
+		
+		# Find Blender executable - use system blender from Docker installation
+		blender_exec = os.environ.get("BLENDER_EXECUTABLE", "/usr/bin/blender")
+		
+		# Run Blender in background mode
+		cmd = [
+			blender_exec, "-b", "-P", blender_script_path, "--",
+			glb_path, fbx_path
+		]
+		
+		logger.info(f"Running Blender command: {' '.join(cmd)}")
+		
+		process = await loop.run_in_executor(
+			None,
+			lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+		)
+		
+		if process.returncode != 0:
+			logger.error(f"Blender conversion failed: {process.stderr}")
+			raise HTTPException(
+				status_code=500,
+				detail=f"FBX conversion failed: {process.stderr}"
+			)
+		
+		logger.info(f"Blender conversion successful: {process.stdout}")
+		
+		# Upload FBX to GCS
+		object_name = f"{GCS_GLB_PREFIX}/fbx/{cache_key.replace('/', '_').replace(':', '_')}.fbx"
+		bucket = _get_gcs_client().bucket(GCS_BUCKET)
+		blob = bucket.blob(object_name)
+		blob.upload_from_filename(fbx_path, content_type="application/octet-stream")
+		public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
+		
+		# Cache the result
+		_fbx_cache[cache_key] = public_url
+		
+		logger.info(f"FBX uploaded to GCS: {public_url}")
+		return public_url
+		
+	finally:
+		# Clean up temporary files
+		if os.path.exists(glb_path):
+			os.unlink(glb_path)
+		fbx_path = glb_path.replace(".glb", ".fbx")
+		if os.path.exists(fbx_path):
+			os.unlink(fbx_path)
+
+
+@app.post("/export/fbx")
+async def export_fbx(request: dict):
+	"""Export GLB to FBX format using Blender."""
+	
+	glb_url = request.get("glb_url")
+	if not glb_url:
+		raise HTTPException(status_code=400, detail="glb_url is required")
+	
+	try:
+		fbx_url = await _convert_glb_to_fbx(glb_url)
+		return {"fbx_url": fbx_url, "status": "success"}
+	except HTTPException:
+		raise
+	except Exception as exc:
+		logger.error(f"FBX export error: {exc}\n{traceback.format_exc()}")
+		raise HTTPException(status_code=500, detail=f"FBX export failed: {str(exc)}")
+
+
+@app.get("/export/fbx/cache/clear")
+async def clear_fbx_cache():
+	"""Clear FBX export cache."""
+	_fbx_cache.clear()
+	return {"status": "success", "message": "FBX cache cleared"}
 
 
 def main():

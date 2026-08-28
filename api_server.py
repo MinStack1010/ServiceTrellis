@@ -807,91 +807,125 @@ async def process_job(job: Job):
 
 
 def _export_and_upload_glb(
-	vertices, faces, attrs, coords, layout, voxel_size,
-	request: GenerateRequest, job_id: str,
+    vertices, faces, attrs, coords, layout, voxel_size,
+    request: GenerateRequest, job_id: str,
 ) -> str:
+    import subprocess
+    import zipfile
+    import shlex
 
-	_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-	logger.info(f"_export_and_upload_glb start — RAM: {_rss_mb:.0f} MB")
+    _rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
+    logger.info(f"_export_and_upload_glb start — RAM: {_rss_mb:.0f} MB")
 
-	if torch.cuda.is_available():
-		torch.cuda.empty_cache()
-		torch.cuda.synchronize()
-	for _ in range(3):
-		gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    for _ in range(3):
+        gc.collect()
 
-	_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-	logger.info(f"Memory freed before GLB export — RAM: {_rss_mb:.0f} MB")
+    try:
+        glb = o_voxel.postprocess.to_glb(
+            vertices=vertices,
+            faces=faces,
+            attr_volume=attrs,
+            coords=coords,
+            attr_layout=layout,
+            voxel_size=voxel_size,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target=request.decimation_target,
+            texture_size=request.texture_size,
+            remesh=False,
+            verbose=False,
+        )
+    except Exception as exc:
+        logger.error(f"GLB object creation failed: {exc}")
+        raise
 
-	_GLB_TIMEOUT = int(os.environ.get("GLB_EXPORT_TIMEOUT", "300"))  # 5 min hard cap
+    del vertices, faces, attrs, coords, layout, voxel_size
+    gc.collect()
 
-	try:
-		logger.info(
-			f"to_glb params: texture_size={request.texture_size} "
-			f"decimation_target={request.decimation_target}"
-		)
-		glb = o_voxel.postprocess.to_glb(
-			vertices=vertices,
-			faces=faces,
-			attr_volume=attrs,
-			coords=coords,
-			attr_layout=layout,
-			voxel_size=voxel_size,
-			aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-			decimation_target=request.decimation_target,
-			texture_size=request.texture_size,
-			remesh=False,
-			verbose=False,
-		)
-		_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-		logger.info(f"GLB object created successfully — RAM: {_rss_mb:.0f} MB")
-	except MemoryError:
-		logger.error("OOM during GLB creation")
-		raise MemoryError(
-			"Not enough RAM to export this model. "
-			"Try reducing Texture size (e.g. 1024 px) or GLB decimation target."
-		)
-	except Exception as exc:
-		logger.error(f"GLB object creation failed: {exc}\n{traceback.format_exc()}")
-		raise
+    tmp_dir = tempfile.mkdtemp()
+    glb_path = os.path.join(tmp_dir, f"{job_id}.glb")
+    fbx_path = os.path.join(tmp_dir, f"{job_id}.fbx")
+    zip_path = os.path.join(tmp_dir, f"{job_id}_FBX.zip")
+    script_path = os.path.join(tmp_dir, "blender_script.py")
 
-	del vertices, faces, attrs, coords, layout, voxel_size
-	for _ in range(3):
-		gc.collect()
+    bucket = _get_gcs_client().bucket(GCS_BUCKET)
+    public_glb_url = ""
 
-	with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
-		glb_path = tmp.name
+    try:
+        glb.export(glb_path, extension_webp=True)
+        del glb
+        gc.collect()
+        
+        glb_object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
+        glb_blob = bucket.blob(glb_object_name)
+        glb_blob.upload_from_filename(glb_path, content_type="model/gltf-binary")
+        public_glb_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{glb_object_name}"
+        logger.info(f"GLB uploaded to GCS: {public_glb_url}")
 
-	try:
-		logger.info(f"Exporting GLB to temporary file: {glb_path}")
-		glb.export(glb_path, extension_webp=True)
-		logger.info("GLB export to file successful")
+        blender_executable = os.environ.get("BLENDER_PATH", "blender")
+        blender_script = f"""import bpy
+import math
 
-		del glb
-		gc.collect()
+bpy.ops.wm.read_factory_settings(use_empty=True)
 
-		object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
-		bucket = _get_gcs_client().bucket(GCS_BUCKET)
-		blob = bucket.blob(object_name)
-		blob.upload_from_filename(glb_path, content_type="model/gltf-binary")
-		public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
-		logger.info(f"GLB uploaded to GCS: {public_url}")
-		return public_url
+# Import GLB
+bpy.ops.import_scene.gltf(filepath={repr(glb_path)})
 
-	except MemoryError:
-		logger.error("OOM during GLB file export")
-		raise MemoryError(
-			"Not enough RAM to write the GLB file. "
-			"Try reducing Texture size (e.g. 1024 px) or GLB decimation target."
-		)
-	except Exception as exc:
-		logger.error(f"GLB export/upload failed: {exc}\n{traceback.format_exc()}")
-		raise
-	finally:
-		if os.path.exists(glb_path):
-			os.unlink(glb_path)
-			logger.info(f"Temporary file cleaned up: {glb_path}")
+# Fix orientation: GLB imports with rotation. We clear it and apply transforms.
+for obj in bpy.context.scene.objects:
+    if obj.type == 'MESH':
+        matrixcopy = obj.matrix_world.copy()
+        obj.parent = None
+        obj.matrix_world = matrixcopy
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        
+        obj.rotation_euler = (0, 0, 0)
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
 
+bpy.ops.export_scene.fbx(
+    filepath={repr(fbx_path)},
+    use_selection=False,
+    path_mode='COPY',
+    embed_textures=True,
+    mesh_smooth_type='FACE',
+    add_leaf_bones=False,
+    axis_up='Y',
+    axis_forward='-Z'
+)
+"""
+        with open(script_path, 'w') as f:
+            f.write(blender_script)
+
+        try:
+            subprocess.run(
+                [blender_executable, "--background", "--python", script_path], 
+                check=True, 
+                capture_output=True
+            )
+
+            if os.path.exists(fbx_path):
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    zipf.write(fbx_path, f"{job_id}.fbx")
+                
+                fbx_object_name = f"{GCS_GLB_PREFIX}/{job_id}.fbx"
+                fbx_blob = bucket.blob(fbx_object_name)
+                fbx_blob.upload_from_filename(zip_path, content_type="application/zip")
+                logger.info(f"FBX (ZIP) uploaded to GCS at: {fbx_object_name}")
+            else:
+                logger.warning(f"FBX path {fbx_path} does not exist after Blender conversion.")
+
+        except Exception as e:
+            logger.error(f"Blender conversion failed: {e}")
+
+        return public_glb_url
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info(f"Temporary files cleaned up at: {tmp_dir}")
 
 
 def main():

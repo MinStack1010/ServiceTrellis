@@ -11,11 +11,13 @@ import tempfile
 import time
 import traceback
 import uuid
+import subprocess
+import zipfile
+import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
-import subprocess
-import shutil
+
 import o_voxel
 import psutil
 import torch
@@ -302,13 +304,7 @@ async def lifespan(app: FastAPI):
 	global pipeline, job_queue, worker_task, cleanup_task
 
 	model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
-	# Load weights into CPU RAM only — do NOT call pipeline.cuda() here.
-	# Each processing stage will move only the models it needs to GPU and
-	# immediately release them afterwards (per-stage loading).  This keeps
-	# peak VRAM well within the 24 GB L4 budget and prevents OOM crashes
-	# when the entire ~14 GB pipeline is live on the GPU simultaneously.
 	pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
-	# Ensure all sub-models start on CPU
 	pipeline.cpu()
 	logger.info("Pipeline loaded into CPU RAM (per-stage GPU loading enabled)")
 
@@ -363,7 +359,6 @@ app.add_middleware(
 	allow_headers=["*"],
 )
 
-# ── Bot/scanner filter ───────────────────────────────────────────────────────
 _BLOCKED_PREFIXES = (
 	"/.env", "/.git", "/.aws", "/.docker",
 	"/wp-", "/phpinfo", "/info.php",
@@ -401,7 +396,6 @@ async def health():
 
 @app.get("/queue/status", response_model=QueueStatusResponse)
 async def queue_status():
-	"""Public queue status — used by waiting clients to show busy state."""
 	all_jobs = list(jobs.values())
 	processing = [j for j in all_jobs if j.status == JobStatus.PROCESSING]
 	queued    = [j for j in all_jobs if j.status == JobStatus.QUEUED]
@@ -431,7 +425,6 @@ async def queue_status():
 
 @app.post("/generate", response_model=JobResponse)
 async def generate(request: GenerateRequest):
-
 	if pipeline is None or job_queue is None:
 		raise HTTPException(status_code=503, detail="Pipeline not ready")
 
@@ -464,7 +457,6 @@ async def generate(request: GenerateRequest):
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
-
 	job = jobs.get(job_id)
 	if not job:
 		raise HTTPException(status_code=404, detail="Job not found")
@@ -742,27 +734,14 @@ async def process_job(job: Job):
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
 		_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-		logger.info(f"RAM before GLB export: {_rss_mb:.0f} MB")
+		logger.info(f"RAM before model export: {_rss_mb:.0f} MB")
 
-		job.message = "Exporting & uploading GLB..."
+		job.message = "Exporting & uploading models (GLB & FBX)..."
 		job.progress = 80.0
 		await _save_job(job)
 		glb_url = await loop.run_in_executor(
 			None, functools.partial(
 				_export_and_upload_glb,
-				mesh_vertices, mesh_faces, mesh_attrs, mesh_coords,
-				mesh_layout, mesh_voxel_size,
-				job.request, job.job_id,
-			)
-		)
-		
-		job.message = "Exporting & uploading FBX..."
-		job.progress = 88.0
-		await _save_job(job)
-		
-		await loop.run_in_executor(
-			None, functools.partial(
-				_export_and_upload_fbx,
 				mesh_vertices, mesh_faces, mesh_attrs, mesh_coords,
 				mesh_layout, mesh_voxel_size,
 				job.request, job.job_id,
@@ -820,100 +799,16 @@ async def process_job(job: Job):
 		logger.info(f"RAM after job cleanup: {_rss_mb:.0f} MB")
 
 
-
 def _export_and_upload_glb(
-	vertices, faces, attrs, coords, layout, voxel_size,
-	request: GenerateRequest, job_id: str,
-) -> str:
-
-	_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-	logger.info(f"_export_and_upload_glb start — RAM: {_rss_mb:.0f} MB")
-
-	if torch.cuda.is_available():
-		torch.cuda.empty_cache()
-		torch.cuda.synchronize()
-	for _ in range(3):
-		gc.collect()
-
-	_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-	logger.info(f"Memory freed before GLB export — RAM: {_rss_mb:.0f} MB")
-
-	_GLB_TIMEOUT = int(os.environ.get("GLB_EXPORT_TIMEOUT", "300"))  # 5 min hard cap
-
-	try:
-		logger.info(
-			f"to_glb params: texture_size={request.texture_size} "
-			f"decimation_target={request.decimation_target}"
-		)
-		glb = o_voxel.postprocess.to_glb(
-			vertices=vertices,
-			faces=faces,
-			attr_volume=attrs,
-			coords=coords,
-			attr_layout=layout,
-			voxel_size=voxel_size,
-			aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-			decimation_target=request.decimation_target,
-			texture_size=request.texture_size,
-			remesh=False,
-			verbose=False,
-		)
-		_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-		logger.info(f"GLB object created successfully — RAM: {_rss_mb:.0f} MB")
-	except MemoryError:
-		logger.error("OOM during GLB creation")
-		raise MemoryError(
-			"Not enough RAM to export this model. "
-			"Try reducing Texture size (e.g. 1024 px) or GLB decimation target."
-		)
-	except Exception as exc:
-		logger.error(f"GLB object creation failed: {exc}\n{traceback.format_exc()}")
-		raise
-
-	del vertices, faces, attrs, coords, layout, voxel_size
-	for _ in range(3):
-		gc.collect()
-
-	with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
-		glb_path = tmp.name
-
-	try:
-		logger.info(f"Exporting GLB to temporary file: {glb_path}")
-		glb.export(glb_path, extension_webp=True)
-		logger.info("GLB export to file successful")
-
-		del glb
-		gc.collect()
-
-		object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
-		bucket = _get_gcs_client().bucket(GCS_BUCKET)
-		blob = bucket.blob(object_name)
-		blob.upload_from_filename(glb_path, content_type="model/gltf-binary")
-		public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
-		logger.info(f"GLB uploaded to GCS: {public_url}")
-		return public_url
-
-	except MemoryError:
-		logger.error("OOM during GLB file export")
-		raise MemoryError(
-			"Not enough RAM to write the GLB file. "
-			"Try reducing Texture size (e.g. 1024 px) or GLB decimation target."
-		)
-	except Exception as exc:
-		logger.error(f"GLB export/upload failed: {exc}\n{traceback.format_exc()}")
-		raise
-	finally:
-		if os.path.exists(glb_path):
-			os.unlink(glb_path)
-			logger.info(f"Temporary file cleaned up: {glb_path}")
-
-def _export_and_upload_fbx(
     vertices, faces, attrs, coords, layout, voxel_size,
     request: GenerateRequest, job_id: str,
 ) -> str:
+    import subprocess
+    import shutil
+    import tempfile
     
     _rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-    logger.info(f"_export_and_upload_fbx start — RAM: {_rss_mb:.0f} MB")
+    logger.info(f"_export_and_upload_models start — RAM: {_rss_mb:.0f} MB")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -936,19 +831,30 @@ def _export_and_upload_fbx(
             verbose=False,
         )
     except Exception as exc:
-        logger.error(f"GLB object creation failed (for FBX conversion): {exc}")
-        return ""
+        logger.error(f"GLB object creation failed: {exc}")
+        raise
+
+    del vertices, faces, attrs, coords, layout, voxel_size
+    gc.collect()
 
     tmp_dir = tempfile.mkdtemp()
     glb_path = os.path.join(tmp_dir, f"{job_id}.glb")
     fbx_path = os.path.join(tmp_dir, f"{job_id}.fbx")
     script_path = os.path.join(tmp_dir, "blender_script.py")
-    public_fbx_url = ""
+
+    bucket = _get_gcs_client().bucket(GCS_BUCKET)
+    public_glb_url = ""
 
     try:
         glb.export(glb_path, extension_webp=True)
         del glb
         gc.collect()
+        
+        glb_object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
+        glb_blob = bucket.blob(glb_object_name)
+        glb_blob.upload_from_filename(glb_path, content_type="model/gltf-binary")
+        public_glb_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{glb_object_name}"
+        logger.info(f"GLB uploaded to GCS: {public_glb_url}")
 
         blender_executable = os.environ.get("BLENDER_PATH", "blender")
         blender_script = f"""import bpy
@@ -983,29 +889,29 @@ bpy.ops.export_scene.fbx(
         with open(script_path, 'w') as f:
             f.write(blender_script)
 
-        subprocess.run(
+        result = subprocess.run(
             [blender_executable, "--background", "--python", script_path], 
-            check=True, capture_output=True
+            check=False, 
+            capture_output=True,
+            text=True
         )
         
-        if os.path.exists(fbx_path):
-            bucket = _get_gcs_client().bucket(GCS_BUCKET)
-            fbx_object_name = f"{GCS_GLB_PREFIX}/{job_id}.fbx"
-            fbx_blob = bucket.blob(fbx_object_name)
-            
-            fbx_blob.upload_from_filename(fbx_path, content_type="application/octet-stream")
-            
-            public_fbx_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{fbx_object_name}"
-            logger.info(f"FBX uploaded to GCS at: {public_fbx_url}")
+        if result.returncode != 0:
+            logger.error(f"Blender conversion failed with error: {result.stderr}")
         else:
-            logger.warning(f"FBX path {fbx_path} does not exist after Blender conversion.")
-            
-    except Exception as e:
-        logger.error(f"Blender FBX conversion/upload failed: {e}")
+            if os.path.exists(fbx_path):
+                fbx_object_name = f"{GCS_GLB_PREFIX}/{job_id}.fbx"
+                fbx_blob = bucket.blob(fbx_object_name)
+                fbx_blob.upload_from_filename(fbx_path, content_type="application/octet-stream")
+                logger.info(f"FBX uploaded to GCS at: {fbx_object_name}")
+            else:
+                logger.warning(f"Blender success but FBX file missing at {fbx_path}")
+
+        return public_glb_url
+
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        
-    return public_fbx_url
+        logger.info(f"Temporary files cleaned up at: {tmp_dir}")
 
 
 def main():

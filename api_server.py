@@ -14,7 +14,8 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
-
+import subprocess
+import shutil
 import o_voxel
 import psutil
 import torch
@@ -754,6 +755,20 @@ async def process_job(job: Job):
 				job.request, job.job_id,
 			)
 		)
+		
+		job.message = "Exporting & uploading FBX..."
+		job.progress = 88.0
+		await _save_job(job)
+		
+		await loop.run_in_executor(
+			None, functools.partial(
+				_export_and_upload_fbx,
+				mesh_vertices, mesh_faces, mesh_attrs, mesh_coords,
+				mesh_layout, mesh_voxel_size,
+				job.request, job.job_id,
+			)
+		)
+
 		del mesh_vertices, mesh_faces, mesh_attrs, mesh_coords, mesh_layout, mesh_voxel_size
 		for _ in range(3):
 			gc.collect()
@@ -807,15 +822,98 @@ async def process_job(job: Job):
 
 
 def _export_and_upload_glb(
+	vertices, faces, attrs, coords, layout, voxel_size,
+	request: GenerateRequest, job_id: str,
+) -> str:
+
+	_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
+	logger.info(f"_export_and_upload_glb start — RAM: {_rss_mb:.0f} MB")
+
+	if torch.cuda.is_available():
+		torch.cuda.empty_cache()
+		torch.cuda.synchronize()
+	for _ in range(3):
+		gc.collect()
+
+	_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
+	logger.info(f"Memory freed before GLB export — RAM: {_rss_mb:.0f} MB")
+
+	_GLB_TIMEOUT = int(os.environ.get("GLB_EXPORT_TIMEOUT", "300"))  # 5 min hard cap
+
+	try:
+		logger.info(
+			f"to_glb params: texture_size={request.texture_size} "
+			f"decimation_target={request.decimation_target}"
+		)
+		glb = o_voxel.postprocess.to_glb(
+			vertices=vertices,
+			faces=faces,
+			attr_volume=attrs,
+			coords=coords,
+			attr_layout=layout,
+			voxel_size=voxel_size,
+			aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+			decimation_target=request.decimation_target,
+			texture_size=request.texture_size,
+			remesh=False,
+			verbose=False,
+		)
+		_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
+		logger.info(f"GLB object created successfully — RAM: {_rss_mb:.0f} MB")
+	except MemoryError:
+		logger.error("OOM during GLB creation")
+		raise MemoryError(
+			"Not enough RAM to export this model. "
+			"Try reducing Texture size (e.g. 1024 px) or GLB decimation target."
+		)
+	except Exception as exc:
+		logger.error(f"GLB object creation failed: {exc}\n{traceback.format_exc()}")
+		raise
+
+	del vertices, faces, attrs, coords, layout, voxel_size
+	for _ in range(3):
+		gc.collect()
+
+	with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
+		glb_path = tmp.name
+
+	try:
+		logger.info(f"Exporting GLB to temporary file: {glb_path}")
+		glb.export(glb_path, extension_webp=True)
+		logger.info("GLB export to file successful")
+
+		del glb
+		gc.collect()
+
+		object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
+		bucket = _get_gcs_client().bucket(GCS_BUCKET)
+		blob = bucket.blob(object_name)
+		blob.upload_from_filename(glb_path, content_type="model/gltf-binary")
+		public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
+		logger.info(f"GLB uploaded to GCS: {public_url}")
+		return public_url
+
+	except MemoryError:
+		logger.error("OOM during GLB file export")
+		raise MemoryError(
+			"Not enough RAM to write the GLB file. "
+			"Try reducing Texture size (e.g. 1024 px) or GLB decimation target."
+		)
+	except Exception as exc:
+		logger.error(f"GLB export/upload failed: {exc}\n{traceback.format_exc()}")
+		raise
+	finally:
+		if os.path.exists(glb_path):
+			os.unlink(glb_path)
+			logger.info(f"Temporary file cleaned up: {glb_path}")
+
+def _export_and_upload_fbx(
     vertices, faces, attrs, coords, layout, voxel_size,
     request: GenerateRequest, job_id: str,
 ) -> str:
-    import subprocess
-    import zipfile
-    import shlex
-
+    
     _rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-    logger.info(f"_export_and_upload_glb start — RAM: {_rss_mb:.0f} MB")
+    logger.info(f"_export_and_upload_fbx start — RAM: {_rss_mb:.0f} MB")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -838,42 +936,27 @@ def _export_and_upload_glb(
             verbose=False,
         )
     except Exception as exc:
-        logger.error(f"GLB object creation failed: {exc}")
-        raise
-
-    del vertices, faces, attrs, coords, layout, voxel_size
-    gc.collect()
+        logger.error(f"GLB object creation failed (for FBX conversion): {exc}")
+        return ""
 
     tmp_dir = tempfile.mkdtemp()
     glb_path = os.path.join(tmp_dir, f"{job_id}.glb")
     fbx_path = os.path.join(tmp_dir, f"{job_id}.fbx")
-    zip_path = os.path.join(tmp_dir, f"{job_id}_FBX.zip")
     script_path = os.path.join(tmp_dir, "blender_script.py")
-
-    bucket = _get_gcs_client().bucket(GCS_BUCKET)
-    public_glb_url = ""
+    public_fbx_url = ""
 
     try:
         glb.export(glb_path, extension_webp=True)
         del glb
         gc.collect()
-        
-        glb_object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
-        glb_blob = bucket.blob(glb_object_name)
-        glb_blob.upload_from_filename(glb_path, content_type="model/gltf-binary")
-        public_glb_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{glb_object_name}"
-        logger.info(f"GLB uploaded to GCS: {public_glb_url}")
 
         blender_executable = os.environ.get("BLENDER_PATH", "blender")
         blender_script = f"""import bpy
 import math
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
-
-# Import GLB
 bpy.ops.import_scene.gltf(filepath={repr(glb_path)})
 
-# Fix orientation: GLB imports with rotation. We clear it and apply transforms.
 for obj in bpy.context.scene.objects:
     if obj.type == 'MESH':
         matrixcopy = obj.matrix_world.copy()
@@ -900,32 +983,29 @@ bpy.ops.export_scene.fbx(
         with open(script_path, 'w') as f:
             f.write(blender_script)
 
-        try:
-            subprocess.run(
-                [blender_executable, "--background", "--python", script_path], 
-                check=True, 
-                capture_output=True
-            )
-
-            if os.path.exists(fbx_path):
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    zipf.write(fbx_path, f"{job_id}.fbx")
-                
-                fbx_object_name = f"{GCS_GLB_PREFIX}/{job_id}.fbx"
-                fbx_blob = bucket.blob(fbx_object_name)
-                fbx_blob.upload_from_filename(zip_path, content_type="application/zip")
-                logger.info(f"FBX (ZIP) uploaded to GCS at: {fbx_object_name}")
-            else:
-                logger.warning(f"FBX path {fbx_path} does not exist after Blender conversion.")
-
-        except Exception as e:
-            logger.error(f"Blender conversion failed: {e}")
-
-        return public_glb_url
-
+        subprocess.run(
+            [blender_executable, "--background", "--python", script_path], 
+            check=True, capture_output=True
+        )
+        
+        if os.path.exists(fbx_path):
+            bucket = _get_gcs_client().bucket(GCS_BUCKET)
+            fbx_object_name = f"{GCS_GLB_PREFIX}/{job_id}.fbx"
+            fbx_blob = bucket.blob(fbx_object_name)
+            
+            fbx_blob.upload_from_filename(fbx_path, content_type="application/octet-stream")
+            
+            public_fbx_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{fbx_object_name}"
+            logger.info(f"FBX uploaded to GCS at: {public_fbx_url}")
+        else:
+            logger.warning(f"FBX path {fbx_path} does not exist after Blender conversion.")
+            
+    except Exception as e:
+        logger.error(f"Blender FBX conversion/upload failed: {e}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info(f"Temporary files cleaned up at: {tmp_dir}")
+        
+    return public_fbx_url
 
 
 def main():

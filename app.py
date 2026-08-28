@@ -17,6 +17,14 @@ from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
+import os
+from datetime import datetime
+from typing import Tuple
+
+import subprocess
+from datetime import datetime
+from typing import Tuple
+
 
 
 MAX_SEED = np.iinfo(np.int32).max
@@ -465,6 +473,85 @@ def image_to_3d(
     
     return state, full_html
 
+def extract_fbx(
+    state: dict,
+    decimation_target: int,
+    texture_size: int,
+    req: gr.Request,
+    progress=gr.Progress(track_tqdm=True),
+) -> Tuple[str, str]:
+    
+    user_dir = os.path.join(TMP_DIR, str(req.session_hash))[cite: 5]
+    os.makedirs(user_dir, exist_ok=True)[cite: 5]
+    
+    shape_slat, tex_slat, res = unpack_state(state)[cite: 5]
+    mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0][cite: 5]
+    
+    glb_mesh = o_voxel.postprocess.to_glb(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        attr_volume=mesh.attrs,
+        coords=mesh.coords,
+        attr_layout=pipeline.pbr_attr_layout,
+        grid_size=res,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        decimation_target=decimation_target,
+        texture_size=texture_size,
+        remesh=True,
+        remesh_band=1,
+        remesh_project=0,
+        use_tqdm=True,
+    )[cite: 4]
+    
+    now = datetime.now()[cite: 5]
+    timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"[cite: 5]
+    
+    glb_path = os.path.join(user_dir, f'temp_{timestamp}.glb')
+    fbx_path = os.path.join(user_dir, f'sample_{timestamp}.fbx')
+    script_path = os.path.join(user_dir, f'blender_script_{timestamp}.py')
+    
+    glb_mesh.export(glb_path)
+    
+    blender_script = f"""import bpy
+
+# Xóa trắng scene mặc định của Blender
+bpy.ops.wm.read_factory_settings(use_empty=True)
+
+# Import file GLB
+bpy.ops.import_scene.gltf(filepath='{glb_path}')
+
+# Export ra FBX với cờ ép nhúng texture (embed_textures=True)
+bpy.ops.export_scene.fbx(
+    filepath='{fbx_path}',
+    use_selection=False,
+    path_mode='COPY',
+    embed_textures=True,
+    mesh_smooth_type='FACE',
+    add_leaf_bones=False
+)
+"""
+    with open(script_path, 'w') as f:
+        f.write(blender_script)
+
+    try:
+        subprocess.run(
+            ["blender", "--background", "--python", script_path], 
+            check=True, 
+            capture_output=True
+        )
+    except Exception as e:
+        print(f"Lỗi khi gọi Blender: {e}")
+        return None, glb_path
+    finally:
+        # 4. Dọn dẹp file tạm
+        if os.path.exists(glb_path):
+            os.remove(glb_path)
+        if os.path.exists(script_path):
+            os.remove(script_path)
+            
+    torch.cuda.empty_cache()[cite: 5]
+    
+    return None, fbx_path
 
 def extract_glb(
     state: dict,
@@ -518,6 +605,10 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
             
             generate_btn = gr.Button("Generate")
+
+            with gr.Row():
+                extract_glb_btn = gr.Button("Extract GLB")
+                extract_fbx_btn = gr.Button("Extract FBX")
                 
             with gr.Accordion(label="Advanced Settings", open=False):                
                 gr.Markdown("Stage 1: Sparse Structure Generation")
@@ -545,7 +636,10 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
                     preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
                 with gr.Step("Extract", id=1):
                     glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
-                    download_btn = gr.DownloadButton(label="Download GLB")
+                    with gr.Row():
+                        download_glb_btn = gr.DownloadButton(label="Download GLB")
+                        download_fbx_btn = gr.DownloadButton(label="Download FBX (ZIP)")
+                    # download_btn = gr.DownloadButton(label="Download GLB")
                     
         with gr.Column(scale=1, min_width=172):
             examples = gr.Examples(
@@ -597,6 +691,22 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
     #     inputs=[output_buf, decimation_target, texture_size],
     #     outputs=[glb_output, download_btn],
     # )
+
+    extract_glb_btn.click(
+        lambda: gr.Walkthrough(selected=1), outputs=walkthrough
+    ).then(
+        extract_glb,
+        inputs=[output_buf, decimation_target, texture_size],
+        outputs=[glb_output, download_glb_btn],
+    )
+    
+    extract_fbx_btn.click(
+        lambda: gr.Walkthrough(selected=1), outputs=walkthrough
+    ).then(
+        extract_fbx,
+        inputs=[output_buf, decimation_target, texture_size],
+        outputs=[glb_output, download_fbx_btn], 
+    )
         
 
 # Launch the Gradio app

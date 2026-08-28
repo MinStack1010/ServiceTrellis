@@ -1,31 +1,26 @@
 import gradio as gr
-
 import os
-os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-from datetime import datetime
 import shutil
 import cv2
-from typing import *
 import torch
 import numpy as np
-from PIL import Image
 import base64
 import io
+import subprocess
+import shlex
+from datetime import datetime
+from typing import Tuple, Dict, Any
+from PIL import Image
+
+# Pipeline & Renderers (TRELLIS)
 from trellis2.modules.sparse import SparseTensor
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
-import os
-from datetime import datetime
-from typing import Tuple
 
-import subprocess
-from datetime import datetime
-from typing import Tuple
-
-
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 MAX_SEED = np.iinfo(np.int32).max
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
@@ -41,208 +36,51 @@ STEPS = 8
 DEFAULT_MODE = 3
 DEFAULT_STEP = 3
 
-
 css = """
 /* Overwrite Gradio Default Style */
-.stepper-wrapper {
-    padding: 0;
-}
-
-.stepper-container {
-    padding: 0;
-    align-items: center;
-}
-
-.step-button {
-    flex-direction: row;
-}
-
-.step-connector {
-    transform: none;
-}
-
-.step-number {
-    width: 16px;
-    height: 16px;
-}
-
-.step-label {
-    position: relative;
-    bottom: 0;
-}
-
-.wrap.center.full {
-    inset: 0;
-    height: 100%;
-}
-
-.wrap.center.full.translucent {
-    background: var(--block-background-fill);
-}
-
-.meta-text-center {
-    display: block !important;
-    position: absolute !important;
-    top: unset !important;
-    bottom: 0 !important;
-    right: 0 !important;
-    transform: unset !important;
-}
+.stepper-wrapper { padding: 0; }
+.stepper-container { padding: 0; align-items: center; }
+.step-button { flex-direction: row; }
+.step-connector { transform: none; }
+.step-number { width: 16px; height: 16px; }
+.step-label { position: relative; bottom: 0; }
+.wrap.center.full { inset: 0; height: 100%; }
+.wrap.center.full.translucent { background: var(--block-background-fill); }
+.meta-text-center { display: block !important; position: absolute !important; top: unset !important; bottom: 0 !important; right: 0 !important; transform: unset !important; }
 
 /* Previewer */
-.previewer-container {
-    position: relative;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    width: 100%;
-    height: 722px;
-    margin: 0 auto;
-    padding: 20px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-}
-
-.previewer-container .tips-icon {
-    position: absolute;
-    right: 10px;
-    top: 10px;
-    z-index: 10;
-    border-radius: 10px;
-    color: #fff;
-    background-color: var(--color-accent);
-    padding: 3px 6px;
-    user-select: none;
-}
-
-.previewer-container .tips-text {
-    position: absolute;
-    right: 10px;
-    top: 50px;
-    color: #fff;
-    background-color: var(--color-accent);
-    border-radius: 10px;
-    padding: 6px;
-    text-align: left;
-    max-width: 300px;
-    z-index: 10;
-    transition: all 0.3s;
-    opacity: 0%;
-    user-select: none;
-}
-
-.previewer-container .tips-text p {
-    font-size: 14px;
-    line-height: 1.2;
-}
-
-.tips-icon:hover + .tips-text { 
-    display: block;
-    opacity: 100%;
-}
+.previewer-container { position: relative; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; width: 100%; height: 722px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.previewer-container .tips-icon { position: absolute; right: 10px; top: 10px; z-index: 10; border-radius: 10px; color: #fff; background-color: var(--color-accent); padding: 3px 6px; user-select: none; }
+.previewer-container .tips-text { position: absolute; right: 10px; top: 50px; color: #fff; background-color: var(--color-accent); border-radius: 10px; padding: 6px; text-align: left; max-width: 300px; z-index: 10; transition: all 0.3s; opacity: 0%; user-select: none; }
+.previewer-container .tips-text p { font-size: 14px; line-height: 1.2; }
+.tips-icon:hover + .tips-text { display: block; opacity: 100%; }
 
 /* Row 1: Display Modes */
-.previewer-container .mode-row {
-    width: 100%;
-    display: flex;
-    gap: 8px;
-    justify-content: center;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-}
-.previewer-container .mode-btn {
-    width: 24px;
-    height: 24px;
-    border-radius: 50%;
-    cursor: pointer;
-    opacity: 0.5;
-    transition: all 0.2s;
-    border: 2px solid #ddd;
-    object-fit: cover;
-}
+.previewer-container .mode-row { width: 100%; display: flex; gap: 8px; justify-content: center; margin-bottom: 20px; flex-wrap: wrap; }
+.previewer-container .mode-btn { width: 24px; height: 24px; border-radius: 50%; cursor: pointer; opacity: 0.5; transition: all 0.2s; border: 2px solid #ddd; object-fit: cover; }
 .previewer-container .mode-btn:hover { opacity: 0.9; transform: scale(1.1); }
-.previewer-container .mode-btn.active {
-    opacity: 1;
-    border-color: var(--color-accent);
-    transform: scale(1.1);
-}
+.previewer-container .mode-btn.active { opacity: 1; border-color: var(--color-accent); transform: scale(1.1); }
 
 /* Row 2: Display Image */
-.previewer-container .display-row {
-    margin-bottom: 20px;
-    min-height: 400px;
-    width: 100%;
-    flex-grow: 1;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-}
-.previewer-container .previewer-main-image {
-    max-width: 100%;
-    max-height: 100%;
-    flex-grow: 1;
-    object-fit: contain;
-    display: none;
-}
-.previewer-container .previewer-main-image.visible {
-    display: block;
-}
+.previewer-container .display-row { margin-bottom: 20px; min-height: 400px; width: 100%; flex-grow: 1; display: flex; justify-content: center; align-items: center; }
+.previewer-container .previewer-main-image { max-width: 100%; max-height: 100%; flex-grow: 1; object-fit: contain; display: none; }
+.previewer-container .previewer-main-image.visible { display: block; }
 
 /* Row 3: Custom HTML Slider */
-.previewer-container .slider-row {
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 10px;
-    padding: 0 10px;
-}
-
-.previewer-container input[type=range] {
-    -webkit-appearance: none;
-    width: 100%;
-    max-width: 400px;
-    background: transparent;
-}
-.previewer-container input[type=range]::-webkit-slider-runnable-track {
-    width: 100%;
-    height: 8px;
-    cursor: pointer;
-    background: #ddd;
-    border-radius: 5px;
-}
-.previewer-container input[type=range]::-webkit-slider-thumb {
-    height: 20px;
-    width: 20px;
-    border-radius: 50%;
-    background: var(--color-accent);
-    cursor: pointer;
-    -webkit-appearance: none;
-    margin-top: -6px;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-    transition: transform 0.1s;
-}
-.previewer-container input[type=range]::-webkit-slider-thumb:hover {
-    transform: scale(1.2);
-}
+.previewer-container .slider-row { width: 100%; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 0 10px; }
+.previewer-container input[type=range] { -webkit-appearance: none; width: 100%; max-width: 400px; background: transparent; }
+.previewer-container input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 8px; cursor: pointer; background: #ddd; border-radius: 5px; }
+.previewer-container input[type=range]::-webkit-slider-thumb { height: 20px; width: 20px; border-radius: 50%; background: var(--color-accent); cursor: pointer; -webkit-appearance: none; margin-top: -6px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: transform 0.1s; }
+.previewer-container input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.2); }
 
 /* Overwrite Previewer Block Style */
-.gradio-container .padded:has(.previewer-container) {
-    padding: 0 !important;
-}
-
-.gradio-container:has(.previewer-container) [data-testid="block-label"] {
-    position: absolute;
-    top: 0;
-    left: 0;
-}
+.gradio-container .padded:has(.previewer-container) { padding: 0 !important; }
+.gradio-container:has(.previewer-container) [data-testid="block-label"] { position: absolute; top: 0; left: 0; }
 """
-
 
 head = """
 <script>
     function refreshView(mode, step) {
-        // 1. Find current mode and step
         const allImgs = document.querySelectorAll('.previewer-main-image');
         for (let i = 0; i < allImgs.length; i++) {
             const img = allImgs[i];
@@ -254,49 +92,27 @@ head = """
                 break;
             }
         }
-        
-        // 2. Hide ALL images
-        // We select all elements with class 'previewer-main-image'
         allImgs.forEach(img => img.classList.remove('visible'));
-
-        // 3. Construct the specific ID for the current state
-        // Format: view-m{mode}-s{step}
         const targetId = 'view-m' + mode + '-s' + step;
         const targetImg = document.getElementById(targetId);
-
-        // 4. Show ONLY the target
-        if (targetImg) {
-            targetImg.classList.add('visible');
-        }
-
-        // 5. Update Button Highlights
+        if (targetImg) { targetImg.classList.add('visible'); }
         const allBtns = document.querySelectorAll('.mode-btn');
         allBtns.forEach((btn, idx) => {
             if (idx === mode) btn.classList.add('active');
             else btn.classList.remove('active');
         });
     }
-    
-    // --- Action: Switch Mode ---
-    function selectMode(mode) {
-        refreshView(mode, -1);
-    }
-    
-    // --- Action: Slider Change ---
-    function onSliderChange(val) {
-        refreshView(-1, parseInt(val));
-    }
+    function selectMode(mode) { refreshView(mode, -1); }
+    function onSliderChange(val) { refreshView(-1, parseInt(val)); }
 </script>
 """
 
-
 empty_html = f"""
 <div class="previewer-container">
-    <svg style=" opacity: .5; height: var(--size-5); color: var(--body-text-color);"
+    <svg style="opacity: .5; height: var(--size-5); color: var(--body-text-color);"
     xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="feather feather-image"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
 </div>
 """
-
 
 def image_to_base64(image):
     buffered = io.BytesIO()
@@ -305,30 +121,18 @@ def image_to_base64(image):
     img_str = base64.b64encode(buffered.getvalue()).decode()
     return f"data:image/jpeg;base64,{img_str}"
 
-
 def start_session(req: gr.Request):
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     os.makedirs(user_dir, exist_ok=True)
     
-    
 def end_session(req: gr.Request):
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
-    shutil.rmtree(user_dir)
-
+    if os.path.exists(user_dir):
+        shutil.rmtree(user_dir)
 
 def preprocess_image(image: Image.Image) -> Image.Image:
-    """
-    Preprocess the input image.
-
-    Args:
-        image (Image.Image): The input image.
-
-    Returns:
-        Image.Image: The preprocessed image.
-    """
     processed_image = pipeline.preprocess_image(image)
     return processed_image
-
 
 def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
     shape_slat, tex_slat, res = latents
@@ -339,7 +143,6 @@ def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
         'res': res,
     }
     
-    
 def unpack_state(state: dict) -> Tuple[SparseTensor, SparseTensor, int]:
     shape_slat = SparseTensor(
         feats=torch.from_numpy(state['shape_slat_feats']).cuda(),
@@ -348,13 +151,8 @@ def unpack_state(state: dict) -> Tuple[SparseTensor, SparseTensor, int]:
     tex_slat = shape_slat.replace(torch.from_numpy(state['tex_slat_feats']).cuda())
     return shape_slat, tex_slat, state['res']
 
-
 def get_seed(randomize_seed: bool, seed: int) -> int:
-    """
-    Get the random seed.
-    """
     return np.random.randint(0, MAX_SEED) if randomize_seed else seed
-
 
 def image_to_3d(
     image: Image.Image,
@@ -375,7 +173,6 @@ def image_to_3d(
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
 ) -> str:
-    # --- Sampling ---
     outputs, latents = pipeline.run(
         image,
         seed=seed,
@@ -406,43 +203,24 @@ def image_to_3d(
         return_latent=True,
     )
     mesh = outputs[0]
-    mesh.simplify(16777216) # nvdiffrast limit
+    mesh.simplify(16777216) 
     images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
     state = pack_state(latents)
     torch.cuda.empty_cache()
     
-    # --- HTML Construction ---
-    # The Stack of 48 Images
     images_html = ""
     for m_idx, mode in enumerate(MODES):
         for s_idx in range(STEPS):
-            # ID Naming Convention: view-m{mode}-s{step}
             unique_id = f"view-m{m_idx}-s{s_idx}"
-            
-            # Logic: Only Mode 0, Step 0 is visible initially
             is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
             vis_class = "visible" if is_visible else ""
-            
-            # Image Source
             img_base64 = image_to_base64(Image.fromarray(images[mode['render_key']][s_idx]))
-            
-            # Render the Tag
-            images_html += f"""
-                <img id="{unique_id}" 
-                     class="previewer-main-image {vis_class}" 
-                     src="{img_base64}" 
-                     loading="eager">
-            """
+            images_html += f"""<img id="{unique_id}" class="previewer-main-image {vis_class}" src="{img_base64}" loading="eager">"""
     
     btns_html = ""
     for idx, mode in enumerate(MODES):        
         active_class = "active" if idx == DEFAULT_MODE else ""
-        btns_html += f"""
-            <img src="{mode['icon_base64']}" 
-                 class="mode-btn {active_class}" 
-                 onclick="selectMode({idx})"
-                 title="{mode['name']}">
-        """
+        btns_html += f"""<img src="{mode['icon_base64']}" class="mode-btn {active_class}" onclick="selectMode({idx})" title="{mode['name']}">"""
     
     full_html = f"""
     <div class="previewer-container">
@@ -453,24 +231,13 @@ def image_to_3d(
                 <p>● <b>View Angle</b> - Drag the slider to change the view angle.</p>
             </div>
         </div>
-        
-        <!-- Row 1: Viewport containing 48 static <img> tags -->
-        <div class="display-row">
-            {images_html}
-        </div>
-        
-        <!-- Row 2 -->
-        <div class="mode-row" id="btn-group">
-            {btns_html}
-        </div>
-
-        <!-- Row 3: Slider -->
+        <div class="display-row">{images_html}</div>
+        <div class="mode-row" id="btn-group">{btns_html}</div>
         <div class="slider-row">
             <input type="range" id="custom-slider" min="0" max="{STEPS - 1}" value="{DEFAULT_STEP}" step="1" oninput="onSliderChange(this.value)">
         </div>
     </div>
     """
-    
     return state, full_html
 
 def extract_fbx(
@@ -481,12 +248,13 @@ def extract_fbx(
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[str, str]:
     
-    user_dir = os.path.join(TMP_DIR, str(req.session_hash))[cite: 5]
-    os.makedirs(user_dir, exist_ok=True)[cite: 5]
+    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
+    os.makedirs(user_dir, exist_ok=True)
     
-    shape_slat, tex_slat, res = unpack_state(state)[cite: 5]
-    mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0][cite: 5]
+    shape_slat, tex_slat, res = unpack_state(state)
+    mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
     
+    # Export temporary GLB
     glb_mesh = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
         faces=mesh.faces,
@@ -501,10 +269,10 @@ def extract_fbx(
         remesh_band=1,
         remesh_project=0,
         use_tqdm=True,
-    )[cite: 4]
+    )
     
-    now = datetime.now()[cite: 5]
-    timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"[cite: 5]
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
     
     glb_path = os.path.join(user_dir, f'temp_{timestamp}.glb')
     fbx_path = os.path.join(user_dir, f'sample_{timestamp}.fbx')
@@ -512,22 +280,42 @@ def extract_fbx(
     
     glb_mesh.export(glb_path)
     
-    blender_script = f"""import bpy
+    blender_executable = os.environ.get("BLENDER_PATH", "blender")
 
-# Xóa trắng scene mặc định của Blender
+    # The script now explicitly un-parents the glTF root and zeroes rotation before export
+    blender_script = f"""import bpy
+import math
+
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
-# Import file GLB
-bpy.ops.import_scene.gltf(filepath='{glb_path}')
+# Import GLB
+bpy.ops.import_scene.gltf(filepath={repr(glb_path)})
 
-# Export ra FBX với cờ ép nhúng texture (embed_textures=True)
+# Fix orientation: GLB imports with rotation. We clear it and apply transforms.
+for obj in bpy.context.scene.objects:
+    if obj.type == 'MESH':
+        # Unparent to remove glTF root hierarchy
+        matrixcopy = obj.matrix_world.copy()
+        obj.parent = None
+        obj.matrix_world = matrixcopy
+        
+        # Select the object and clear rotation to fix orientation mismatch
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        
+        obj.rotation_euler = (0, 0, 0)
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+
 bpy.ops.export_scene.fbx(
-    filepath='{fbx_path}',
+    filepath={repr(fbx_path)},
     use_selection=False,
     path_mode='COPY',
     embed_textures=True,
     mesh_smooth_type='FACE',
-    add_leaf_bones=False
+    add_leaf_bones=False,
+    axis_up='Y',
+    axis_forward='-Z'
 )
 """
     with open(script_path, 'w') as f:
@@ -535,23 +323,23 @@ bpy.ops.export_scene.fbx(
 
     try:
         subprocess.run(
-            ["blender", "--background", "--python", script_path], 
+            [blender_executable, "--background", "--python", script_path], 
             check=True, 
             capture_output=True
         )
     except Exception as e:
-        print(f"Lỗi khi gọi Blender: {e}")
-        return None, glb_path
+        print(f"Blender conversion failed: {e}")
+        if os.path.exists(glb_path):
+            return glb_path, glb_path
     finally:
-        # 4. Dọn dẹp file tạm
         if os.path.exists(glb_path):
             os.remove(glb_path)
         if os.path.exists(script_path):
             os.remove(script_path)
             
-    torch.cuda.empty_cache()[cite: 5]
+    torch.cuda.empty_cache()
     
-    return None, fbx_path
+    return fbx_path, fbx_path
 
 def extract_glb(
     state: dict,
@@ -586,12 +374,11 @@ def extract_glb(
     torch.cuda.empty_cache()
     return glb_path, glb_path
 
-
 with gr.Blocks(delete_cache=(600, 600)) as demo:
     gr.Markdown("""
     ## Image to 3D Asset with [TRELLIS.2](https://microsoft.github.io/TRELLIS.2)
     * Upload an image (preferably with an alpha-masked foreground object) and click Generate to create a 3D asset.
-    * Click Extract GLB to export and download the generated GLB file if you're satisfied with the result. Otherwise, try another time.
+    * Click Extract GLB or Extract FBX to export the asset.
     """)
     
     with gr.Row():
@@ -635,11 +422,10 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
                 with gr.Step("Preview", id=0):
                     preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
                 with gr.Step("Extract", id=1):
-                    glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
+                    glb_output = gr.Model3D(label="Extracted Model", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
                     with gr.Row():
                         download_glb_btn = gr.DownloadButton(label="Download GLB")
-                        download_fbx_btn = gr.DownloadButton(label="Download FBX (ZIP)")
-                    # download_btn = gr.DownloadButton(label="Download GLB")
+                        download_fbx_btn = gr.DownloadButton(label="Download FBX")
                     
         with gr.Column(scale=1, min_width=172):
             examples = gr.Examples(
@@ -656,7 +442,6 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
                     
     output_buf = gr.State()
     
-
     # Handlers
     demo.load(start_session)
     demo.unload(end_session)
@@ -683,14 +468,6 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         ],
         outputs=[output_buf, preview_output],
     )
-    
-    # extract_btn.click(
-    #     lambda: gr.Walkthrough(selected=1), outputs=walkthrough
-    # ).then(
-    #     extract_glb,
-    #     inputs=[output_buf, decimation_target, texture_size],
-    #     outputs=[glb_output, download_btn],
-    # )
 
     extract_glb_btn.click(
         lambda: gr.Walkthrough(selected=1), outputs=walkthrough
@@ -708,8 +485,6 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         outputs=[glb_output, download_fbx_btn], 
     )
         
-
-# Launch the Gradio app
 if __name__ == "__main__":
     os.makedirs(TMP_DIR, exist_ok=True)
 

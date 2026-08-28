@@ -863,17 +863,10 @@ import math
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath={repr(glb_path)})
 
-for obj in bpy.context.scene.objects:
-    if obj.type == 'MESH':
-        matrixcopy = obj.matrix_world.copy()
+for obj in list(bpy.data.objects):
+    if obj.parent:
+        obj.matrix_world = obj.matrix_world.copy()
         obj.parent = None
-        obj.matrix_world = matrixcopy
-        bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
-        bpy.context.view_layer.objects.active = obj
-        
-        obj.rotation_euler = (0, 0, 0)
-        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
 
 bpy.ops.export_scene.fbx(
     filepath={repr(fbx_path)},
@@ -882,8 +875,7 @@ bpy.ops.export_scene.fbx(
     embed_textures=True,
     mesh_smooth_type='FACE',
     add_leaf_bones=False,
-    axis_up='Y',
-    axis_forward='-Z'
+    bake_space_transform=True
 )
 """
         with open(script_path, 'w') as f:

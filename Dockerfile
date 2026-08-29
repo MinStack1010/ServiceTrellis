@@ -39,15 +39,21 @@ RUN set -ex; \
     fi
 
 # Ensure Pillow is available to Blender's Python for WebP->PNG conversion
-RUN BLENDER_PY=$(blender --background --python-expr "import sys; print(sys.executable)" 2>/dev/null | tail -1 | tr -d '[:space:]'); \
+# CRITICAL: Blender's Python is separate from system Python — must install into it directly
+ARG PILLLOW_REBUILD=20260829
+RUN set -ex; \
+    BLENDER_PY=$(blender --background --python-expr "import sys; print(sys.executable)" 2>&1 | tail -1 | tr -d '[:space:]'); \
     echo "Blender Python: $BLENDER_PY"; \
-    "$BLENDER_PY" -m pip install Pillow 2>/dev/null || \
-    (SYSTEM_PILLOW=$(/usr/bin/python3 -c "import PIL, os; print(os.path.dirname(PIL.__file__))" 2>/dev/null) && \
-     DEST=$("$BLENDER_PY" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null) && \
-     echo "Copying Pillow from system: $SYSTEM_PILLOW -> $DEST" && \
-     cp -r "$SYSTEM_PILLOW" "$DEST/"); \
-    blender --background --python-expr "from PIL import Image; print('[Dockerfile] Pillow OK:', Image.__version__)" 2>/dev/null || \
-    echo "WARNING: Pillow not available in Blender - WebP conversion may fail"
+    "$BLENDER_PY" --version; \
+    echo "Step 1: ensuring pip in Blender Python..."; \
+    "$BLENDER_PY" -m ensurepip --upgrade 2>&1 || true; \
+    "$BLENDER_PY" -m pip install --upgrade pip 2>&1 || true; \
+    echo "Step 2: pip installing Pillow..."; \
+    "$BLENDER_PY" -m pip install Pillow --break-system-packages 2>&1 || \
+    "$BLENDER_PY" -m pip install Pillow 2>&1 || true; \
+    echo "Step 3: verifying Pillow..."; \
+    blender --background --python-expr "from PIL import Image; print('[Dockerfile] Pillow OK:', Image.__version__)" 2>&1; \
+    echo "Step 4: done"
 
 WORKDIR /app
 

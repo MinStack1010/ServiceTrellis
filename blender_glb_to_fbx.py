@@ -61,6 +61,43 @@ def _ensure_materials(mesh_obj):
                          f"size={node.image.size[0]}x{node.image.size[1]}")
 
 
+def _verify_material_connections(mesh_obj):
+    """Verify that textures are properly connected to Principled BSDF inputs."""
+    issues = 0
+    for slot in mesh_obj.material_slots:
+        mat = slot.material
+        if mat is None or not mat.use_nodes or not mat.node_tree:
+            continue
+
+        principled = None
+        for node in mat.node_tree.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                principled = node
+                break
+
+        if principled is None:
+            _log(f"  WARNING: Material '{mat.name}' has no Principled BSDF node")
+            issues += 1
+            continue
+
+        connected_images = set()
+        for link in mat.node_tree.links:
+            if link.from_node.type == 'TEX_IMAGE' and link.from_node.image:
+                connected_images.add(link.from_node.name)
+
+        for node in mat.node_tree.nodes:
+            if node.type == 'TEX_IMAGE' and node.name not in connected_images:
+                _log(f"  WARNING: '{mat.name}' orphaned texture '{node.name}' (not connected to Principled BSDF)")
+                issues += 1
+
+        base_color_linked = principled.inputs['Base Color'].is_linked
+        if not base_color_linked:
+            _log(f"  WARNING: '{mat.name}' Base Color not connected")
+            issues += 1
+
+    return issues
+
+
 def _force_smooth_shading(objs):
     """Set all mesh objects to smooth shading (preserves vertex normals from GLB)."""
     for o in objs:
@@ -173,7 +210,8 @@ def _preprocess_glb_webp_to_png(glb_path):
     _log(f"  GLB extensionsUsed: {ext_used}")
     _log(f"  GLB extensionsRequired: {ext_req}")
 
-    has_webp_ext = 'EXT_texture_webp' in ext_used or 'EXT_texture_webp' in ext_req
+    has_webp_ext = ('EXT_texture_webp' in ext_used or 'EXT_texture_webp' in ext_req or
+                     'KHR_texture_webp' in ext_used or 'KHR_texture_webp' in ext_req)
 
     webp_views = _find_webp_buffer_views(gltf, bin_data) if bin_data else []
     _log(f"  WebP magic bytes found in {len(webp_views)} bufferViews: {webp_views}")
@@ -208,6 +246,8 @@ def _preprocess_glb_webp_to_png(glb_path):
     for i, image in enumerate(images):
         mime = image.get('mimeType', '')
         ext_data = image.get('extensions', {}).get('EXT_texture_webp', {})
+        if not ext_data:
+            ext_data = image.get('extensions', {}).get('KHR_texture_webp', {})
         bv_index = ext_data.get('bufferView')
 
         if bv_index is None:
@@ -284,6 +324,10 @@ def _preprocess_glb_webp_to_png(glb_path):
                 found_in_images = True
                 break
             ext_data = img.get('extensions', {}).get('EXT_texture_webp', {})
+            if ext_data.get('bufferView') == i:
+                found_in_images = True
+                break
+            ext_data = img.get('extensions', {}).get('KHR_texture_webp', {})
             if ext_data.get('bufferView') == i:
                 found_in_images = True
                 break
@@ -369,7 +413,7 @@ def _build_fbx_export_kwargs():
         axis_up='Y',
         object_types={'MESH', 'ARMATURE', 'EMPTY', 'CAMERA', 'LIGHT'},
         use_mesh_modifiers=True,
-        mesh_smooth_type='OFF',
+        mesh_smooth_type='FACE',
         path_mode='COPY',
         batch_mode='OFF',
         use_metadata=True,
@@ -597,9 +641,14 @@ def glb_to_fbx(glb_path, fbx_path):
     # ── Diagnostic dump ──────────────────────────────────────────────
     _dump_mesh_diagnostics("AFTER IMPORT", imported_objects)
     mesh_objs = [o for o in imported_objects if o.type == 'MESH']
+    total_connection_issues = 0
     for o in mesh_objs:
         _log(f"  '{o.name}' materials:")
         _ensure_materials(o)
+        total_connection_issues += _verify_material_connections(o)
+
+    if total_connection_issues > 0:
+        _log(f"  WARNING: {total_connection_issues} material connection issue(s) detected")
 
     # ── Select all imported objects ──────────────────────────────────
     bpy.ops.object.select_all(action='DESELECT')
@@ -612,6 +661,44 @@ def glb_to_fbx(glb_path, fbx_path):
     _log("Fixing shading & normals for FBX export...")
     _force_smooth_shading(imported_objects)
     _ensure_split_normals(imported_objects)
+
+    # ── Verify textures loaded & pack them into Blender ─────────────
+    _log("Verifying textures and packing for FBX export...")
+    total_tex = 0
+    pack_failures = 0
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or not mat.node_tree:
+            continue
+        tex_count = 0
+        for node in mat.node_tree.nodes:
+            if node.type == 'TEX_IMAGE' and node.image:
+                tex_count += 1
+                if not node.image.packed_file:
+                    try:
+                        node.image.pack()
+                    except Exception as exc:
+                        _log(f"    FAILED to pack texture '{node.image.name}': {exc}")
+                        pack_failures += 1
+                        continue
+
+                if node.image.packed_file:
+                    packed_size = len(node.image.packed_file.data)
+                    _log(f"    Packed: '{node.image.name}' ({node.image.size[0]}x{node.image.size[1]}, {packed_size} bytes)")
+                else:
+                    _log(f"    CRITICAL: '{node.image.name}' pack() succeeded but packed_file is None")
+                    pack_failures += 1
+        total_tex += tex_count
+        if tex_count > 0:
+            _log(f"  Material '{mat.name}': {tex_count} texture(s)")
+        else:
+            _log(f"  WARNING: Material '{mat.name}' has NO textures — FBX will be untextured")
+
+    if pack_failures > 0:
+        _log(f"  WARNING: {pack_failures} texture(s) failed to pack — FBX may be missing textures")
+    if total_tex == 0:
+        _log("WARNING: No textures found across all materials — FBX will have flat shading only")
+    else:
+        _log(f"  Total textures: {total_tex} (packed: {total_tex - pack_failures})")
 
     # ── Ensure output directory exists ───────────────────────────────
     out_dir = os.path.dirname(fbx_path)

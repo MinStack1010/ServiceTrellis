@@ -854,8 +854,8 @@ def _export_and_upload_glb(
 
 	try:
 		logger.info(f"Exporting GLB to temporary file: {glb_path}")
-		glb.export(glb_path, extension_webp=True)
-		logger.info("GLB export to file successful")
+		glb.export(glb_path, extension_webp=False)
+		logger.info("GLB export to file successful (PNG textures for Blender compatibility)")
 
 		del glb
 		gc.collect()

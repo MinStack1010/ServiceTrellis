@@ -16,22 +16,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git libgl1 libglib2.0-0 libjpeg-dev ninja-build \
+        python3-numpy python3-pip \
         blender && \
     rm -rf /var/lib/apt/lists/*
 
-# Install numpy into Blender's bundled Python (required by glTF importer addon)
-# Method 1: Find Blender's Python directly and pip install numpy
-# Method 2: If Blender uses system Python, apt python3-numpy covers it
+# Ensure numpy is available to Blender's Python (3-layer fallback).
 RUN set -ex; \
-    BLENDER_PY=$(find /usr -path "*/blender/*/python/bin/python*" -type f 2>/dev/null | head -1); \
-    if [ -n "$BLENDER_PY" ]; then \
-        echo "Blender Python found: $BLENDER_PY"; \
-        $BLENDER_PY -m pip install numpy; \
+    if blender --background --python-expr "import numpy; print('[Dockerfile] numpy OK:', numpy.__version__)" 2>/dev/null; then \
+        echo "Layer 1: numpy already works in Blender"; \
     else \
-        echo "Blender Python not found, trying blender --python-expr"; \
-        blender --background --python-expr "import subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy'])" ; \
-    fi; \
-    blender --background --python-expr "import numpy; print('numpy OK:', numpy.__version__)"
+        echo "Layer 2: finding Blender Python and pip installing..."; \
+        BLENDER_PY=$(blender --background --python-expr "import sys; print(sys.executable)" 2>/dev/null | tail -1 | tr -d '[:space:]'); \
+        echo "Blender Python: $BLENDER_PY"; \
+        "$BLENDER_PY" -m pip install numpy 2>/dev/null && \
+        blender --background --python-expr "import numpy; print('[Dockerfile] numpy OK after pip:', numpy.__version__)" 2>/dev/null && exit 0; \
+        echo "Layer 3: copying numpy from system Python..."; \
+        SYSTEM_NUMPY=$(/usr/bin/python3 -c "import numpy, os; print(os.path.dirname(numpy.__file__))" 2>/dev/null); \
+        DEST=$("$BLENDER_PY" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null); \
+        echo "System numpy: $SYSTEM_NUMPY -> $DEST"; \
+        cp -r "$SYSTEM_NUMPY" "$DEST/" && \
+        blender --background --python-expr "import numpy; print('[Dockerfile] numpy OK after copy:', numpy.__version__)"; \
+    fi
 
 WORKDIR /app
 

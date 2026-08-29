@@ -16,44 +16,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git libgl1 libglib2.0-0 libjpeg-dev ninja-build \
-        python3-numpy python3-pip \
+        python3-numpy python3-pip python3-pil \
         blender && \
     rm -rf /var/lib/apt/lists/*
 
-# Ensure numpy is available to Blender's Python (3-layer fallback).
-RUN set -ex; \
-    if blender --background --python-expr "import numpy; print('[Dockerfile] numpy OK:', numpy.__version__)" 2>/dev/null; then \
-        echo "Layer 1: numpy already works in Blender"; \
-    else \
-        echo "Layer 2: finding Blender Python and pip installing..."; \
-        BLENDER_PY=$(blender --background --python-expr "import sys; print(sys.executable)" 2>/dev/null | tail -1 | tr -d '[:space:]'); \
-        echo "Blender Python: $BLENDER_PY"; \
-        "$BLENDER_PY" -m pip install numpy 2>/dev/null && \
-        blender --background --python-expr "import numpy; print('[Dockerfile] numpy OK after pip:', numpy.__version__)" 2>/dev/null && exit 0; \
-        echo "Layer 3: copying numpy from system Python..."; \
-        SYSTEM_NUMPY=$(/usr/bin/python3 -c "import numpy, os; print(os.path.dirname(numpy.__file__))" 2>/dev/null); \
-        DEST=$("$BLENDER_PY" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null); \
-        echo "System numpy: $SYSTEM_NUMPY -> $DEST"; \
-        cp -r "$SYSTEM_NUMPY" "$DEST/" && \
-        blender --background --python-expr "import numpy; print('[Dockerfile] numpy OK after copy:', numpy.__version__)"; \
-    fi
-
-# Ensure Pillow is available to Blender's Python for WebP->PNG conversion
-# CRITICAL: Blender's Python is separate from system Python — must install into it directly
-ARG PILLLOW_REBUILD=20260829
-RUN set -ex; \
-    BLENDER_PY=$(blender --background --python-expr "import sys; print(sys.executable)" 2>/dev/null | grep -v '^Blender' | tail -1 | tr -d '[:space:]'); \
-    echo "Blender Python: $BLENDER_PY"; \
-    "$BLENDER_PY" --version; \
-    echo "Step 1: ensuring pip in Blender Python..."; \
-    "$BLENDER_PY" -m ensurepip --upgrade 2>&1 || true; \
-    "$BLENDER_PY" -m pip install --upgrade pip 2>&1 || true; \
-    echo "Step 2: pip installing Pillow..."; \
-    "$BLENDER_PY" -m pip install Pillow --break-system-packages 2>&1 || \
-    "$BLENDER_PY" -m pip install Pillow 2>&1 || true; \
-    echo "Step 3: verifying Pillow..."; \
-    blender --background --python-expr "from PIL import Image; print('[Dockerfile] Pillow OK:', Image.__version__)" 2>&1; \
-    echo "Step 4: done"
+RUN blender --background --python-expr "import numpy; from PIL import Image; print(f'[Dockerfile] Numpy OK: {numpy.__version__} | Pillow OK: {Image.__version__}')"
 
 WORKDIR /app
 

@@ -1021,8 +1021,11 @@ async def _convert_glb_to_fbx(glb_url: str) -> str:
 
 			loop = asyncio.get_running_loop()
 			try:
+				if _fbx_semaphore is None:
+					raise HTTPException(status_code=503, detail="FBX conversion not ready — server still starting up")
 				async with _fbx_semaphore:
-					logger.info(f"Blender semaphore acquired ({_fbx_semaphore._value} remaining)")
+					available = _fbx_semaphore._value if hasattr(_fbx_semaphore, '_value') else '?'
+					logger.info(f"Blender semaphore acquired ({available} remaining)")
 					process = await loop.run_in_executor(
 						None,
 						lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=300)

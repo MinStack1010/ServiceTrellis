@@ -20,9 +20,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # Install numpy into Blender's bundled Python (required by glTF importer addon)
-RUN blender --background --python-expr "import subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy'])" 2>&1 || \
-    (BLENDER_PY=$(find /usr -path "*/blender/*/python/bin/python*" -type f 2>/dev/null | head -1) && \
-     if [ -n "$BLENDER_PY" ]; then $BLENDER_PY -m pip install numpy; fi)
+# Method 1: Find Blender's Python directly and pip install numpy
+# Method 2: If Blender uses system Python, apt python3-numpy covers it
+RUN set -ex; \
+    BLENDER_PY=$(find /usr -path "*/blender/*/python/bin/python*" -type f 2>/dev/null | head -1); \
+    if [ -n "$BLENDER_PY" ]; then \
+        echo "Blender Python found: $BLENDER_PY"; \
+        $BLENDER_PY -m pip install numpy; \
+    else \
+        echo "Blender Python not found, trying blender --python-expr"; \
+        blender --background --python-expr "import subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy'])" ; \
+    fi; \
+    blender --background --python-expr "import numpy; print('numpy OK:', numpy.__version__)"
 
 WORKDIR /app
 

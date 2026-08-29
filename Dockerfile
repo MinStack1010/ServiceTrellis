@@ -19,6 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         blender && \
     rm -rf /var/lib/apt/lists/*
 
+# Install numpy into Blender's bundled Python (required by glTF importer addon)
+RUN blender --background --python-expr "import subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy'])" 2>&1 || \
+    (BLENDER_PY=$(find /usr -path "*/blender/*/python/bin/python*" -type f 2>/dev/null | head -1) && \
+     if [ -n "$BLENDER_PY" ]; then $BLENDER_PY -m pip install numpy; fi)
+
 WORKDIR /app
 
 COPY requirements-service.txt ./

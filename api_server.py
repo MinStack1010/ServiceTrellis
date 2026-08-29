@@ -11,13 +11,11 @@ import tempfile
 import time
 import traceback
 import uuid
-import subprocess
-import zipfile
-import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
-
+import subprocess
+import shutil
 import o_voxel
 import psutil
 import torch
@@ -304,7 +302,13 @@ async def lifespan(app: FastAPI):
 	global pipeline, job_queue, worker_task, cleanup_task
 
 	model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
+	# Load weights into CPU RAM only — do NOT call pipeline.cuda() here.
+	# Each processing stage will move only the models it needs to GPU and
+	# immediately release them afterwards (per-stage loading).  This keeps
+	# peak VRAM well within the 24 GB L4 budget and prevents OOM crashes
+	# when the entire ~14 GB pipeline is live on the GPU simultaneously.
 	pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
+	# Ensure all sub-models start on CPU
 	pipeline.cpu()
 	logger.info("Pipeline loaded into CPU RAM (per-stage GPU loading enabled)")
 
@@ -359,6 +363,7 @@ app.add_middleware(
 	allow_headers=["*"],
 )
 
+# ── Bot/scanner filter ───────────────────────────────────────────────────────
 _BLOCKED_PREFIXES = (
 	"/.env", "/.git", "/.aws", "/.docker",
 	"/wp-", "/phpinfo", "/info.php",
@@ -396,6 +401,7 @@ async def health():
 
 @app.get("/queue/status", response_model=QueueStatusResponse)
 async def queue_status():
+	"""Public queue status — used by waiting clients to show busy state."""
 	all_jobs = list(jobs.values())
 	processing = [j for j in all_jobs if j.status == JobStatus.PROCESSING]
 	queued    = [j for j in all_jobs if j.status == JobStatus.QUEUED]
@@ -425,6 +431,7 @@ async def queue_status():
 
 @app.post("/generate", response_model=JobResponse)
 async def generate(request: GenerateRequest):
+
 	if pipeline is None or job_queue is None:
 		raise HTTPException(status_code=503, detail="Pipeline not ready")
 
@@ -457,6 +464,7 @@ async def generate(request: GenerateRequest):
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
+
 	job = jobs.get(job_id)
 	if not job:
 		raise HTTPException(status_code=404, detail="Job not found")
@@ -734,14 +742,15 @@ async def process_job(job: Job):
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
 		_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-		logger.info(f"RAM before model export: {_rss_mb:.0f} MB")
+		logger.info(f"RAM before GLB export: {_rss_mb:.0f} MB")
 
 		job.message = "Exporting & uploading models (GLB & FBX)..."
 		job.progress = 80.0
 		await _save_job(job)
+
 		glb_url = await loop.run_in_executor(
 			None, functools.partial(
-				_export_and_upload_glb,
+				_export_and_upload_assets,
 				mesh_vertices, mesh_faces, mesh_attrs, mesh_coords,
 				mesh_layout, mesh_voxel_size,
 				job.request, job.job_id,
@@ -799,16 +808,14 @@ async def process_job(job: Job):
 		logger.info(f"RAM after job cleanup: {_rss_mb:.0f} MB")
 
 
-def _export_and_upload_glb(
+
+def _export_and_upload_assets(
     vertices, faces, attrs, coords, layout, voxel_size,
     request: GenerateRequest, job_id: str,
 ) -> str:
-    import subprocess
-    import shutil
-    import tempfile
     
     _rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-    logger.info(f"_export_and_upload_models start — RAM: {_rss_mb:.0f} MB")
+    logger.info(f"_export_and_upload_assets start — RAM: {_rss_mb:.0f} MB")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -817,6 +824,7 @@ def _export_and_upload_glb(
         gc.collect()
 
     try:
+        # 1. TẠO OBJECT GLB MỘT LẦN DUY NHẤT (Khắc phục OOM)
         glb = o_voxel.postprocess.to_glb(
             vertices=vertices,
             faces=faces,
@@ -834,39 +842,49 @@ def _export_and_upload_glb(
         logger.error(f"GLB object creation failed: {exc}")
         raise
 
-    del vertices, faces, attrs, coords, layout, voxel_size
-    gc.collect()
-
     tmp_dir = tempfile.mkdtemp()
-    glb_path = os.path.join(tmp_dir, f"{job_id}.glb")
+    glb_webp_path = os.path.join(tmp_dir, f"{job_id}_webp.glb")
+    glb_no_webp_path = os.path.join(tmp_dir, f"{job_id}_nowebp.glb")
     fbx_path = os.path.join(tmp_dir, f"{job_id}.fbx")
     script_path = os.path.join(tmp_dir, "blender_script.py")
-
-    bucket = _get_gcs_client().bucket(GCS_BUCKET)
     public_glb_url = ""
 
     try:
-        glb.export(glb_path, extension_webp=True)
+        # 2. Xuất file GLB chuẩn (có WebP) để Front-End sử dụng
+        glb.export(glb_webp_path, extension_webp=True)
+        
+        # 3. Xuất file GLB riêng (KHÔNG WebP) để tương thích với Blender
+        glb.export(glb_no_webp_path, extension_webp=False)
+        
+        # Giải phóng object khỏi RAM ngay sau khi lưu file tạm
         del glb
         gc.collect()
-        
+
+        # 4. Upload file GLB lên Google Cloud Storage
+        bucket = _get_gcs_client().bucket(GCS_BUCKET)
         glb_object_name = f"{GCS_GLB_PREFIX}/{job_id}.glb"
         glb_blob = bucket.blob(glb_object_name)
-        glb_blob.upload_from_filename(glb_path, content_type="model/gltf-binary")
+        glb_blob.upload_from_filename(glb_webp_path, content_type="model/gltf-binary")
         public_glb_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{glb_object_name}"
         logger.info(f"GLB uploaded to GCS: {public_glb_url}")
 
+        # 5. Gọi Blender Convert GLB -> FBX
         blender_executable = os.environ.get("BLENDER_PATH", "blender")
         blender_script = f"""import bpy
-import math
-
 bpy.ops.wm.read_factory_settings(use_empty=True)
-bpy.ops.import_scene.gltf(filepath={repr(glb_path)})
+bpy.ops.import_scene.gltf(filepath={repr(glb_no_webp_path)})
 
-for obj in list(bpy.data.objects):
-    if obj.parent:
-        obj.matrix_world = obj.matrix_world.copy()
+for obj in bpy.context.scene.objects:
+    if obj.type == 'MESH':
+        matrixcopy = obj.matrix_world.copy()
         obj.parent = None
+        obj.matrix_world = matrixcopy
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        
+        obj.rotation_euler = (0, 0, 0)
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
 
 bpy.ops.export_scene.fbx(
     filepath={repr(fbx_path)},
@@ -875,36 +893,37 @@ bpy.ops.export_scene.fbx(
     embed_textures=True,
     mesh_smooth_type='FACE',
     add_leaf_bones=False,
-    bake_space_transform=True
+    axis_up='Y',
+    axis_forward='-Z'
 )
 """
         with open(script_path, 'w') as f:
             f.write(blender_script)
 
-        result = subprocess.run(
-            [blender_executable, "--background", "--python", script_path], 
-            check=False, 
-            capture_output=True,
-            text=True
-        )
+        try:
+            # Thêm capture_output=True và text=True để bắt log lỗi từ Blender
+            subprocess.run(
+                [blender_executable, "--background", "--python", script_path], 
+                check=True, capture_output=True, text=True
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Blender script failed with error:\n{e.stderr}")
+            # Raise lỗi để job đánh dấu FAILED thay vì âm thầm trả về string rỗng
+            raise RuntimeError(f"FBX conversion failed in Blender: {e.stderr}")
         
-        if result.returncode != 0:
-            logger.error(f"Blender conversion failed with error: {result.stderr}")
+        # 6. Upload file FBX lên Google Cloud Storage
+        if os.path.exists(fbx_path):
+            fbx_object_name = f"{GCS_GLB_PREFIX}/{job_id}.fbx"
+            fbx_blob = bucket.blob(fbx_object_name)
+            fbx_blob.upload_from_filename(fbx_path, content_type="application/octet-stream")
+            logger.info(f"FBX uploaded to GCS at: https://storage.googleapis.com/{GCS_BUCKET}/{fbx_object_name}")
         else:
-            if os.path.exists(fbx_path):
-                fbx_object_name = f"{GCS_GLB_PREFIX}/{job_id}.fbx"
-                fbx_blob = bucket.blob(fbx_object_name)
-                fbx_blob.upload_from_filename(fbx_path, content_type="application/octet-stream")
-                logger.info(f"FBX uploaded to GCS at: {fbx_object_name}")
-            else:
-                logger.warning(f"Blender success but FBX file missing at {fbx_path}")
-
-        return public_glb_url
+            raise RuntimeError(f"FBX path {fbx_path} does not exist after Blender conversion.")
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info(f"Temporary files cleaned up at: {tmp_dir}")
-
+        
+    return public_glb_url
 
 def main():
 	parser = argparse.ArgumentParser(description="TRELLIS.2 API Server")

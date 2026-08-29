@@ -42,7 +42,7 @@ RUN set -ex; \
 # CRITICAL: Blender's Python is separate from system Python — must install into it directly
 ARG PILLLOW_REBUILD=20260829
 RUN set -ex; \
-    BLENDER_PY=$(blender --background --python-expr "import sys; print(sys.executable)" 2>&1 | tail -1 | tr -d '[:space:]'); \
+    BLENDER_PY=$(blender --background --python-expr "import sys; print(sys.executable)" 2>/dev/null | grep -v '^Blender' | tail -1 | tr -d '[:space:]'); \
     echo "Blender Python: $BLENDER_PY"; \
     "$BLENDER_PY" --version; \
     echo "Step 1: ensuring pip in Blender Python..."; \

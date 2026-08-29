@@ -3,6 +3,7 @@ import asyncio
 import base64
 import functools
 import gc
+import hashlib
 import io
 import json
 import logging
@@ -290,13 +291,16 @@ def _model_to_cpu(model_key: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-	global pipeline, job_queue, worker_task, cleanup_task
+	global pipeline, job_queue, worker_task, cleanup_task, _fbx_semaphore
 
 	model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
 	
 	pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
 	pipeline.cpu()
 	logger.info("Pipeline loaded into CPU RAM (per-stage GPU loading enabled)")
+
+	_fbx_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BLENDER)
+	logger.info(f"FBX concurrency limit: {MAX_CONCURRENT_BLENDER} parallel Blender processes")
 
 	job_queue = asyncio.Queue()
 
@@ -880,108 +884,230 @@ def _export_and_upload_glb(
 
 
 # FBX export cache
-_fbx_cache: dict[str, str] = {}  # glb_url -> fbx_url
+_fbx_cache: dict[str, tuple[str, float]] = {}  # glb_url -> (fbx_url, timestamp)
 _FBX_CACHE_TTL = 3600  # 1 hour
+_fbx_locks: dict[str, asyncio.Lock] = {}  # per-URL lock to prevent duplicate conversions
+# Concurrency limit: each Blender process uses ~1GB CPU RAM. With 31GB total
+# and ~14GB free, max 2 concurrent Blender processes is safe.
+MAX_CONCURRENT_BLENDER = int(os.environ.get("MAX_CONCURRENT_BLENDER", "2"))
+_fbx_semaphore: asyncio.Semaphore | None = None  # initialized in startup
 
 
 def _get_fbx_cache_key(glb_url: str) -> str:
-	"""Generate cache key from GLB URL."""
-	return glb_url
+	"""Generate safe, deterministic cache key from GLB URL."""
+	return hashlib.sha256(glb_url.encode()).hexdigest()[:32]
+
+
+def _find_blender_executable() -> str:
+
+	explicit = os.environ.get("BLENDER_EXECUTABLE")
+	if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+		return explicit
+
+	candidates = [
+		"/usr/bin/blender",
+		"/usr/local/bin/blender",
+		"/opt/blender/blender",
+		# macOS .app bundles
+		"/Applications/Blender.app/Contents/MacOS/Blender",
+		os.path.expanduser("~/Applications/Blender.app/Contents/MacOS/Blender"),
+		# Homebrew / Linuxbrew
+		"/opt/homebrew/bin/blender",
+		"/usr/local/homebrew/bin/blender",
+	]
+	for c in candidates:
+		if os.path.isfile(c) and os.access(c, os.X_OK):
+			return c
+
+	try:
+		import shutil
+		w = shutil.which("blender")
+		if w:
+			return w
+	except Exception:
+		pass
+
+	# Fallback: return the env default; caller will surface FileNotFoundError clearly
+	return explicit or "/usr/bin/blender"
 
 
 async def _convert_glb_to_fbx(glb_url: str) -> str:
 	"""Convert GLB to FBX using Blender script."""
-	
-	# Check cache first
+	import aiohttp
+
+	# Check cache first (with TTL enforcement)
 	cache_key = _get_fbx_cache_key(glb_url)
 	if cache_key in _fbx_cache:
-		cached_fbx_url = _fbx_cache[cache_key]
-		# Verify cached URL is still valid
-		try:
-			import aiohttp
-			async with aiohttp.ClientSession() as session:
-				async with session.head(cached_fbx_url) as resp:
-					if resp.status == 200:
-						logger.info(f"FBX cache hit for {glb_url}")
-						return cached_fbx_url
-		except Exception:
-			logger.warning(f"Cached FBX URL invalid, regenerating")
+		cached_fbx_url, cached_ts = _fbx_cache[cache_key]
+		if time.time() - cached_ts < _FBX_CACHE_TTL:
+			# Verify cached URL is still reachable (only fail on explicit 404)
+			try:
+				async with aiohttp.ClientSession() as session:
+					async with session.head(cached_fbx_url) as resp:
+						if resp.status != 404:
+							logger.info(f"FBX cache hit for {glb_url}")
+							return cached_fbx_url
+						logger.warning(f"Cached FBX returned 404, regenerating")
+			except (aiohttp.ClientError, asyncio.TimeoutError):
+				# Transient network error — keep cache, assume valid
+				logger.info(f"FBX cache hit (HEAD check failed transiently) for {glb_url}")
+				return cached_fbx_url
+		else:
+			logger.info(f"FBX cache expired for {glb_url}")
 			del _fbx_cache[cache_key]
-	
-	logger.info(f"Converting GLB to FBX: {glb_url}")
-	
-	# Download GLB file
-	loop = asyncio.get_event_loop()
-	
-	with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as glb_tmp:
-		glb_path = glb_tmp.name
-	
-	try:
-		# Download GLB from URL
-		import aiohttp
-		async with aiohttp.ClientSession() as session:
-			async with session.get(glb_url) as resp:
-				if resp.status != 200:
-					raise HTTPException(status_code=400, detail=f"Failed to download GLB: HTTP {resp.status}")
-				glb_content = await resp.read()
-		
-		with open(glb_path, "wb") as f:
-			f.write(glb_content)
-		
-		# Create output path for FBX
+
+	# Per-URL lock prevents duplicate concurrent Blender conversions
+	if cache_key not in _fbx_locks:
+		_fbx_locks[cache_key] = asyncio.Lock()
+
+	async with _fbx_locks[cache_key]:
+		# Double-check: another coroutine may have completed while we waited
+		if cache_key in _fbx_cache:
+			cached_fbx_url, cached_ts = _fbx_cache[cache_key]
+			if time.time() - cached_ts < _FBX_CACHE_TTL:
+				logger.info(f"FBX cache hit after lock wait for {glb_url}")
+				return cached_fbx_url
+
+		logger.info(f"Converting GLB to FBX: {glb_url}")
+
+		with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as glb_tmp:
+			glb_path = glb_tmp.name
+
 		fbx_path = glb_path.replace(".glb", ".fbx")
-		
-		# Run Blender conversion script
-		blender_script_path = os.path.join(os.path.dirname(__file__), "blender_glb_to_fbx.py")
-		
-		if not os.path.exists(blender_script_path):
-			raise HTTPException(status_code=500, detail="Blender conversion script not found")
-		
-		# Find Blender executable - use system blender from Docker installation
-		blender_exec = os.environ.get("BLENDER_EXECUTABLE", "/usr/bin/blender")
-		
-		# Run Blender in background mode
-		cmd = [
-			blender_exec, "-b", "-P", blender_script_path, "--",
-			glb_path, fbx_path
-		]
-		
-		logger.info(f"Running Blender command: {' '.join(cmd)}")
-		
-		process = await loop.run_in_executor(
-			None,
-			lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-		)
-		
-		if process.returncode != 0:
-			logger.error(f"Blender conversion failed: {process.stderr}")
-			raise HTTPException(
-				status_code=500,
-				detail=f"FBX conversion failed: {process.stderr}"
-			)
-		
-		logger.info(f"Blender conversion successful: {process.stdout}")
-		
-		# Upload FBX to GCS
-		object_name = f"{GCS_GLB_PREFIX}/fbx/{cache_key.replace('/', '_').replace(':', '_')}.fbx"
-		bucket = _get_gcs_client().bucket(GCS_BUCKET)
-		blob = bucket.blob(object_name)
-		blob.upload_from_filename(fbx_path, content_type="application/octet-stream")
-		public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
-		
-		# Cache the result
-		_fbx_cache[cache_key] = public_url
-		
-		logger.info(f"FBX uploaded to GCS: {public_url}")
-		return public_url
-		
-	finally:
-		# Clean up temporary files
-		if os.path.exists(glb_path):
-			os.unlink(glb_path)
-		fbx_path = glb_path.replace(".glb", ".fbx")
-		if os.path.exists(fbx_path):
-			os.unlink(fbx_path)
+
+		try:
+			# Download GLB from URL
+			async with aiohttp.ClientSession() as session:
+				async with session.get(glb_url) as resp:
+					if resp.status != 200:
+						raise HTTPException(status_code=400, detail=f"Failed to download GLB: HTTP {resp.status}")
+					glb_content = await resp.read()
+
+			if len(glb_content) == 0:
+				raise HTTPException(status_code=400, detail="Downloaded GLB is empty (0 bytes)")
+
+			with open(glb_path, "wb") as f:
+				f.write(glb_content)
+
+			logger.info(f"GLB saved to temp file: {glb_path} ({len(glb_content)} bytes)")
+
+			# Locate Blender executable
+			blender_script_path = os.path.join(os.path.dirname(__file__), "blender_glb_to_fbx.py")
+
+			if not os.path.exists(blender_script_path):
+				raise HTTPException(status_code=500, detail=f"Blender conversion script not found: {blender_script_path}")
+
+			blender_exec = _find_blender_executable()
+			logger.info(f"Using Blender executable: {blender_exec}")
+
+			if not os.path.isfile(blender_exec):
+				raise HTTPException(
+					status_code=500,
+					detail=(
+						f"Blender executable not found at '{blender_exec}'. "
+						f"Set BLENDER_EXECUTABLE env var or install Blender. "
+						f"Searched: /usr/bin/blender, /usr/local/bin/blender, "
+						f"/Applications/Blender.app/Contents/MacOS/Blender, /opt/homebrew/bin/blender"
+					)
+				)
+
+			# Run Blender in background mode (with concurrency limit)
+			cmd = [
+				blender_exec, "-b", "-P", blender_script_path, "--",
+				glb_path, fbx_path
+			]
+
+			logger.info(f"Running Blender command: {' '.join(cmd)}")
+
+			loop = asyncio.get_running_loop()
+			try:
+				async with _fbx_semaphore:
+					logger.info(f"Blender semaphore acquired ({_fbx_semaphore._value} remaining)")
+					process = await loop.run_in_executor(
+						None,
+						lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+					)
+			except FileNotFoundError as exc:
+				raise HTTPException(
+					status_code=500,
+					detail=f"Blender executable not found: {blender_exec}. Set BLENDER_EXECUTABLE env var. ({exc})"
+				)
+			except subprocess.TimeoutExpired:
+				raise HTTPException(
+					status_code=500,
+					detail="FBX conversion timed out (Blender took >300s)"
+				)
+
+			# Always log Blender output (stdout + stderr) for debugging
+			if process.stdout:
+				logger.info(f"Blender stdout: {process.stdout}")
+			if process.stderr:
+				logger.warning(f"Blender stderr: {process.stderr}")
+
+			if process.returncode != 0:
+				logger.error(f"Blender conversion failed (exit {process.returncode})")
+				raise HTTPException(
+					status_code=500,
+					detail=(
+						f"FBX conversion failed (Blender exit code {process.returncode}). "
+						f"stderr: {(process.stderr or '').strip()[:4000]}"
+					)
+				)
+
+			logger.info("Blender process exited 0 — verifying output file...")
+
+			if not os.path.exists(fbx_path):
+				logger.error(
+					f"Blender returned exit code 0 but FBX file does NOT exist: {fbx_path}. "
+					f"stdout: {(process.stdout or '')[:500]}. "
+					f"stderr: {(process.stderr or '')[:500]}"
+				)
+				raise HTTPException(
+					status_code=500,
+					detail=(
+						"Blender reported success but wrote no FBX output file. "
+						"This usually means the GLB import or FBX export failed silently inside Blender. "
+						"Check server logs for Blender's stdout/stderr."
+					)
+				)
+
+			fbx_size = os.path.getsize(fbx_path)
+			if fbx_size == 0:
+				logger.error(f"Blender returned exit code 0 but FBX file is EMPTY: {fbx_path}")
+				raise HTTPException(
+					status_code=500,
+					detail="Blender reported success but FBX output is 0 bytes."
+				)
+
+			logger.info(f"Blender conversion successful: {fbx_path} ({fbx_size} bytes)")
+
+			# Upload FBX to GCS (cache_key is already a safe hex hash)
+			object_name = f"{GCS_GLB_PREFIX}/fbx/{cache_key}.fbx"
+			bucket = _get_gcs_client().bucket(GCS_BUCKET)
+			blob = bucket.blob(object_name)
+			blob.upload_from_filename(fbx_path, content_type="application/octet-stream")
+			public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
+
+			# Cache the result with timestamp
+			_fbx_cache[cache_key] = (public_url, time.time())
+
+			logger.info(f"FBX uploaded to GCS: {public_url}")
+			return public_url
+
+		finally:
+			# Clean up temporary files
+			if os.path.exists(glb_path):
+				try:
+					os.unlink(glb_path)
+					logger.info(f"Cleaned up temp GLB: {glb_path}")
+				except Exception as exc:
+					logger.warning(f"Failed to clean up temp GLB {glb_path}: {exc}")
+			if os.path.exists(fbx_path):
+				try:
+					os.unlink(fbx_path)
+					logger.info(f"Cleaned up temp FBX: {fbx_path}")
+				except Exception as exc:
+					logger.warning(f"Failed to clean up temp FBX {fbx_path}: {exc}")
 
 
 @app.post("/export/fbx")
@@ -1002,7 +1128,7 @@ async def export_fbx(request: dict):
 		raise HTTPException(status_code=500, detail=f"FBX export failed: {str(exc)}")
 
 
-@app.get("/export/fbx/cache/clear")
+@app.post("/export/fbx/cache/clear")
 async def clear_fbx_cache():
 	"""Clear FBX export cache."""
 	_fbx_cache.clear()

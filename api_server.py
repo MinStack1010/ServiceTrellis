@@ -1048,12 +1048,16 @@ async def _convert_glb_to_fbx(glb_url: str) -> str:
 				logger.warning(f"Blender stderr: {process.stderr}")
 
 			if process.returncode != 0:
+				stdout_text = (process.stdout or '').strip()
+				stderr_text = (process.stderr or '').strip()
 				logger.error(f"Blender conversion failed (exit {process.returncode})")
+				logger.error(f"Blender stdout: {stdout_text}")
+				logger.error(f"Blender stderr: {stderr_text}")
 				raise HTTPException(
 					status_code=500,
 					detail=(
 						f"FBX conversion failed (Blender exit code {process.returncode}). "
-						f"stderr: {(process.stderr or '').strip()[:4000]}"
+						f"stdout: {stdout_text[:4000]}\nstderr: {stderr_text[:4000]}"
 					)
 				)
 

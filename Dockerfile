@@ -38,6 +38,17 @@ RUN set -ex; \
         blender --background --python-expr "import numpy; print('[Dockerfile] numpy OK after copy:', numpy.__version__)"; \
     fi
 
+# Ensure Pillow is available to Blender's Python for WebP->PNG conversion
+RUN BLENDER_PY=$(blender --background --python-expr "import sys; print(sys.executable)" 2>/dev/null | tail -1 | tr -d '[:space:]'); \
+    echo "Blender Python: $BLENDER_PY"; \
+    "$BLENDER_PY" -m pip install Pillow 2>/dev/null || \
+    (SYSTEM_PILLOW=$(/usr/bin/python3 -c "import PIL, os; print(os.path.dirname(PIL.__file__))" 2>/dev/null) && \
+     DEST=$("$BLENDER_PY" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null) && \
+     echo "Copying Pillow from system: $SYSTEM_PILLOW -> $DEST" && \
+     cp -r "$SYSTEM_PILLOW" "$DEST/"); \
+    blender --background --python-expr "from PIL import Image; print('[Dockerfile] Pillow OK:', Image.__version__)" 2>/dev/null || \
+    echo "WARNING: Pillow not available in Blender - WebP conversion may fail"
+
 WORKDIR /app
 
 COPY requirements-service.txt ./

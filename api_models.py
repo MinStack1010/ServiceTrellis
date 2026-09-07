@@ -84,3 +84,15 @@ class QueueStatusResponse(BaseModel):
         default=None,
         description="Rough ETA in seconds based on average generation time. None if unknown.",
     )
+
+class EnhanceRequest(BaseModel):
+    glb_url: str = Field(..., description="Public URL of the existing GLB model to refine")
+    image: str = Field(..., description="Base64-encoded reference image for texturing")
+    seed: int = Field(default=0, ge=0, le=4294967295, description="Random seed")
+    resolution: int = Field(default=1024, description="Resolution for conditioning (512 or 1024)")
+    texture_size: int = Field(default=2048, ge=512, le=4096, description="Texture resolution")
+
+    tex_slat_guidance_strength: float = Field(default=2.0, ge=1, le=10)
+    tex_slat_guidance_rescale: float = Field(default=0.15, ge=0, le=1)
+    tex_slat_sampling_steps: int = Field(default=24, ge=1, le=50)
+    tex_slat_rescale_t: float = Field(default=3.5, ge=1, le=6)

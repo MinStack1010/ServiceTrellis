@@ -16,7 +16,6 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
-
 import o_voxel
 import psutil
 import torch
@@ -26,6 +25,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from google.cloud import storage as gcs
 from PIL import Image
+import trimesh
+import urllib.request
+from api_models import EnhanceRequest
+from trellis2.pipelines import Trellis2TexturingPipeline
 
 from api_models import (
 	GenerateRequest,
@@ -296,6 +299,10 @@ async def lifespan(app: FastAPI):
 	model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
 	
 	pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
+	global texturing_pipeline
+	texturing_pipeline = Trellis2TexturingPipeline.from_pretrained(model_id)
+	texturing_pipeline.cpu()
+	logger.info("Texturing Pipeline loaded into CPU RAM")
 	pipeline.cpu()
 	logger.info("Pipeline loaded into CPU RAM (per-stage GPU loading enabled)")
 
@@ -450,6 +457,38 @@ async def generate(request: GenerateRequest):
 
 	return JobResponse(job_id=job_id, status=JobStatus.QUEUED)
 
+@app.post("/enhance", response_model=JobResponse)
+async def enhance_texture(request: EnhanceRequest):
+    if texturing_pipeline is None or job_queue is None:
+        raise HTTPException(status_code=503, detail="Texturing Pipeline not ready")
+
+    if _is_busy():
+        raise HTTPException(status_code=409, detail="Server is busy.")
+
+    try:
+        images = _decode_base64_images([request.image])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    job_id = str(uuid.uuid4())
+    
+    # Tạo một Job ảo để dùng chung hệ thống Queue hiện tại
+    # (Trong thực tế bạn có thể tạo một EnhanceJob class kế thừa từ Job)
+    job = Job(
+        job_id=job_id,
+        request=GenerateRequest(image=request.image), # Mock request để bypass type checker
+        status=JobStatus.QUEUED,
+        message="Enhance job queued",
+    )
+    # Lưu request thật vào một trường tạm để worker sử dụng
+    job._enhance_request = request 
+    job.is_enhance = True
+
+    jobs[job_id] = job
+    await _save_job(job)
+    await job_queue.put(job_id)
+    
+    return JobResponse(job_id=job_id, status=JobStatus.QUEUED)
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
@@ -525,276 +564,497 @@ async def job_cleanup_worker():
 
 
 async def process_job(job: Job):
-	global pipeline, _avg_generation_time
+    # ---------------------------------------------------------
+    # [THÊM MỚI] Kiểm tra nếu đây là Job Enhance Texture
+    # ---------------------------------------------------------
+    if getattr(job, 'is_enhance', False):
+        await process_enhance_job(job)
+        return
+    # ---------------------------------------------------------
 
-	job.status = JobStatus.PROCESSING
-	job.started_at = time.time()
-	job.progress = 0.0
-	job.message = "Starting generation..."
-	logger.info(f"Processing job {job.job_id}")
-	await _save_job(job)
+    global pipeline, _avg_generation_time
 
-	loop = asyncio.get_event_loop()
+    job.status = JobStatus.PROCESSING
+    job.started_at = time.time()
+    job.progress = 0.0
+    job.message = "Starting generation..."
+    logger.info(f"Processing job {job.job_id}")
+    await _save_job(job)
 
-	try:
-		job.message = "Decoding image..."
-		job.progress = 5.0
-		image_bytes = base64.b64decode(job.request.image)
-		image = Image.open(io.BytesIO(image_bytes))
-		del image_bytes
+    loop = asyncio.get_event_loop()
 
-		pipeline_type = PIPELINE_TYPE_MAP.get(job.request.pipeline_type, job.request.pipeline_type)
+    try:
+        job.message = "Decoding image..."
+        job.progress = 5.0
+        image_bytes = base64.b64decode(job.request.image)
+        image = Image.open(io.BytesIO(image_bytes))
+        del image_bytes
 
-		job.message = "Generating sparse structure..."
-		job.progress = 10.0
-		await _save_job(job)
+        pipeline_type = PIPELINE_TYPE_MAP.get(job.request.pipeline_type, job.request.pipeline_type)
 
-		sparse_structure_sampler_params = {
-			"steps": job.request.ss_sampling_steps,
-			"guidance_strength": job.request.ss_guidance_strength,
-			"guidance_rescale": job.request.ss_guidance_rescale,
-			"rescale_t": job.request.ss_rescale_t,
-		}
-		shape_slat_sampler_params = {
-			"steps": job.request.shape_slat_sampling_steps,
-			"guidance_strength": job.request.shape_slat_guidance_strength,
-			"guidance_rescale": job.request.shape_slat_guidance_rescale,
-			"rescale_t": job.request.shape_slat_rescale_t,
-		}
-		tex_slat_sampler_params = {
-			"steps": job.request.tex_slat_sampling_steps,
-			"guidance_strength": job.request.tex_slat_guidance_strength,
-			"guidance_rescale": job.request.tex_slat_guidance_rescale,
-			"rescale_t": job.request.tex_slat_rescale_t,
-		}
+        job.message = "Generating sparse structure..."
+        job.progress = 10.0
+        await _save_job(job)
 
-		def _run_generation():
-			pipeline.cpu()
-			for _ in range(5):
-				gc.collect()
-			if torch.cuda.is_available():
-				torch.cuda.synchronize()
-				torch.cuda.empty_cache()
-				torch.cuda.reset_peak_memory_stats()
-				torch.cuda.reset_accumulated_memory_stats()
-				torch.cuda.empty_cache()
-				free_vram = torch.cuda.mem_get_info()[0] / 1024**3
-				logger.info(f"VRAM free before generation: {free_vram:.1f} GiB")
+        sparse_structure_sampler_params = {
+            "steps": job.request.ss_sampling_steps,
+            "guidance_strength": job.request.ss_guidance_strength,
+            "guidance_rescale": job.request.ss_guidance_rescale,
+            "rescale_t": job.request.ss_rescale_t,
+        }
+        shape_slat_sampler_params = {
+            "steps": job.request.shape_slat_sampling_steps,
+            "guidance_strength": job.request.shape_slat_guidance_strength,
+            "guidance_rescale": job.request.shape_slat_guidance_rescale,
+            "rescale_t": job.request.shape_slat_rescale_t,
+        }
+        tex_slat_sampler_params = {
+            "steps": job.request.tex_slat_sampling_steps,
+            "guidance_strength": job.request.tex_slat_guidance_strength,
+            "guidance_rescale": job.request.tex_slat_guidance_rescale,
+            "rescale_t": job.request.tex_slat_rescale_t,
+        }
 
-			S = {}
+        def _run_generation():
+            pipeline.cpu()
+            for _ in range(5):
+                gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.reset_accumulated_memory_stats()
+                torch.cuda.empty_cache()
+                free_vram = torch.cuda.mem_get_info()[0] / 1024**3
+                logger.info(f"VRAM free before generation: {free_vram:.1f} GiB")
 
-			pipeline._device = torch.device("cuda")
-			try:
-				S['proc_img'] = pipeline.preprocess_image(image)
-				torch.manual_seed(job.request.seed)
-				S['cond_512'] = pipeline.get_cond([S['proc_img']], 512)
-				S['cond_1024'] = pipeline.get_cond([S['proc_img']], 1024) if pipeline_type != "512" else None
-				del S['proc_img']
+            S = {}
 
-				ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
-				S['coords'] = pipeline.sample_sparse_structure(
-					S['cond_512'], ss_res, 1, sparse_structure_sampler_params
-				)
+            pipeline._device = torch.device("cuda")
+            try:
+                S['proc_img'] = pipeline.preprocess_image(image)
+                torch.manual_seed(job.request.seed)
+                S['cond_512'] = pipeline.get_cond([S['proc_img']], 512)
+                S['cond_1024'] = pipeline.get_cond([S['proc_img']], 1024) if pipeline_type != "512" else None
+                del S['proc_img']
 
-				if pipeline_type == "512":
-					S['shape_slat'] = pipeline.sample_shape_slat(
-						S['cond_512'], pipeline.models["shape_slat_flow_model_512"],
-						S['coords'], shape_slat_sampler_params,
-					)
-					resolution = 512
-				elif pipeline_type == "1024":
-					S['shape_slat'] = pipeline.sample_shape_slat(
-						S['cond_1024'], pipeline.models["shape_slat_flow_model_1024"],
-						S['coords'], shape_slat_sampler_params,
-					)
-					resolution = 1024
-				elif pipeline_type == "1024_cascade":
-					S['shape_slat'], resolution = pipeline.sample_shape_slat_cascade(
-						S['cond_512'], S['cond_1024'],
-						pipeline.models["shape_slat_flow_model_512"],
-						pipeline.models["shape_slat_flow_model_1024"],
-						512, 1024,
-						S['coords'], shape_slat_sampler_params,
-					)
-				else:
-					S['shape_slat'], resolution = pipeline.sample_shape_slat_cascade(
-						S['cond_512'], S['cond_1024'],
-						pipeline.models["shape_slat_flow_model_512"],
-						pipeline.models["shape_slat_flow_model_1024"],
-						512, 1536,
-						S['coords'], shape_slat_sampler_params,
-					)
+                ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
+                S['coords'] = pipeline.sample_sparse_structure(
+                    S['cond_512'], ss_res, 1, sparse_structure_sampler_params
+                )
 
-				del S['coords']
-				if pipeline_type != "512":
-					del S['cond_512']
-				gc.collect()
-				if torch.cuda.is_available():
-					torch.cuda.empty_cache()
+                if pipeline_type == "512":
+                    S['shape_slat'] = pipeline.sample_shape_slat(
+                        S['cond_512'], pipeline.models["shape_slat_flow_model_512"],
+                        S['coords'], shape_slat_sampler_params,
+                    )
+                    resolution = 512
+                elif pipeline_type == "1024":
+                    S['shape_slat'] = pipeline.sample_shape_slat(
+                        S['cond_1024'], pipeline.models["shape_slat_flow_model_1024"],
+                        S['coords'], shape_slat_sampler_params,
+                    )
+                    resolution = 1024
+                elif pipeline_type == "1024_cascade":
+                    S['shape_slat'], resolution = pipeline.sample_shape_slat_cascade(
+                        S['cond_512'], S['cond_1024'],
+                        pipeline.models["shape_slat_flow_model_512"],
+                        pipeline.models["shape_slat_flow_model_1024"],
+                        512, 1024,
+                        S['coords'], shape_slat_sampler_params,
+                    )
+                else:
+                    S['shape_slat'], resolution = pipeline.sample_shape_slat_cascade(
+                        S['cond_512'], S['cond_1024'],
+                        pipeline.models["shape_slat_flow_model_512"],
+                        pipeline.models["shape_slat_flow_model_1024"],
+                        512, 1536,
+                        S['coords'], shape_slat_sampler_params,
+                    )
 
-				if pipeline_type == "512":
-					S['tex_cond'] = S.pop('cond_512')
-					tex_model_key = "tex_slat_flow_model_512"
-				else:
-					S['tex_cond'] = S['cond_1024']
-					tex_model_key = "tex_slat_flow_model_1024"
+                del S['coords']
+                if pipeline_type != "512":
+                    del S['cond_512']
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-				S['tex_slat'] = pipeline.sample_tex_slat(
-					S['tex_cond'],
-					pipeline.models[tex_model_key],
-					S['shape_slat'],
-					tex_slat_sampler_params,
-				)
-				del S['tex_cond']
-				if 'cond_1024' in S:
-					del S['cond_1024']
-				gc.collect()
-				if torch.cuda.is_available():
-					torch.cuda.empty_cache()
+                if pipeline_type == "512":
+                    S['tex_cond'] = S.pop('cond_512')
+                    tex_model_key = "tex_slat_flow_model_512"
+                else:
+                    S['tex_cond'] = S['cond_1024']
+                    tex_model_key = "tex_slat_flow_model_1024"
 
-				meshes = pipeline.decode_latent(S['shape_slat'], S['tex_slat'], resolution)
-				del S['shape_slat'], S['tex_slat']
-				gc.collect()
-				if torch.cuda.is_available():
-					torch.cuda.empty_cache()
+                S['tex_slat'] = pipeline.sample_tex_slat(
+                    S['tex_cond'],
+                    pipeline.models[tex_model_key],
+                    S['shape_slat'],
+                    tex_slat_sampler_params,
+                )
+                del S['tex_cond']
+                if 'cond_1024' in S:
+                    del S['cond_1024']
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-				return meshes, resolution
+                meshes = pipeline.decode_latent(S['shape_slat'], S['tex_slat'], resolution)
+                del S['shape_slat'], S['tex_slat']
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-			finally:
+                return meshes, resolution
 
-				S.clear()
-				pipeline._device = torch.device("cpu")
-				for _ in range(5):
-					gc.collect()
-				pipeline.cpu()
-				if torch.cuda.is_available():
-					torch.cuda.synchronize()
-					torch.cuda.empty_cache()
-					torch.cuda.reset_peak_memory_stats()
-					torch.cuda.reset_accumulated_memory_stats()
-					torch.cuda.empty_cache()
-					free_vram = torch.cuda.mem_get_info()[0] / 1024**3
-					logger.info(f"VRAM free after job: {free_vram:.1f} GiB")
+            finally:
 
-		try:
-			meshes, resolution = await loop.run_in_executor(None, _run_generation)
-		except AttributeError:
-			def _run_full():
-				pipeline._device = torch.device("cuda")
-				try:
-					return pipeline.run(
-						image,
-						seed=job.request.seed,
-						preprocess_image=True,
-						pipeline_type=pipeline_type,
-						sparse_structure_sampler_params=sparse_structure_sampler_params,
-						shape_slat_sampler_params=shape_slat_sampler_params,
-						tex_slat_sampler_params=tex_slat_sampler_params,
-					)
-				finally:
-					pipeline._device = torch.device("cpu")
-					gc.collect()
-					if torch.cuda.is_available():
-						torch.cuda.empty_cache()
-			meshes = await loop.run_in_executor(None, _run_full)
-			resolution = None
+                S.clear()
+                pipeline._device = torch.device("cpu")
+                for _ in range(5):
+                    gc.collect()
+                pipeline.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                    torch.cuda.reset_accumulated_memory_stats()
+                    torch.cuda.empty_cache()
+                    free_vram = torch.cuda.mem_get_info()[0] / 1024**3
+                    logger.info(f"VRAM free after job: {free_vram:.1f} GiB")
 
-		del image
-		gc.collect()
+        try:
+            meshes, resolution = await loop.run_in_executor(None, _run_generation)
+        except AttributeError:
+            def _run_full():
+                pipeline._device = torch.device("cuda")
+                try:
+                    return pipeline.run(
+                        image,
+                        seed=job.request.seed,
+                        preprocess_image=True,
+                        pipeline_type=pipeline_type,
+                        sparse_structure_sampler_params=sparse_structure_sampler_params,
+                        shape_slat_sampler_params=shape_slat_sampler_params,
+                        tex_slat_sampler_params=tex_slat_sampler_params,
+                    )
+                finally:
+                    pipeline._device = torch.device("cpu")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            meshes = await loop.run_in_executor(None, _run_full)
+            resolution = None
 
-		if not meshes:
-			raise RuntimeError("Pipeline returned no meshes — check input image quality")
+        del image
+        gc.collect()
 
-		job.message = "Processing mesh..."
-		job.progress = 70.0
-		await _save_job(job)
-		mesh = meshes[0]
-		del meshes
-		for _ in range(3):
-			gc.collect()
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-			torch.cuda.synchronize()
-			logger.info("VRAM cleared — all models are on CPU, ready for GLB export")
+        if not meshes:
+            raise RuntimeError("Pipeline returned no meshes — check input image quality")
 
-		mesh_vertices = mesh.vertices
-		mesh_faces = mesh.faces
-		mesh_attrs = mesh.attrs
-		mesh_coords = mesh.coords
-		mesh_layout = mesh.layout
-		mesh_voxel_size = mesh.voxel_size
-		n_vertices = int(mesh_vertices.shape[0])
-		n_faces = int(mesh_faces.shape[0])
-		del mesh
-		for _ in range(3):
-			gc.collect()
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-		_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-		logger.info(f"RAM before GLB export: {_rss_mb:.0f} MB")
+        job.message = "Processing mesh..."
+        job.progress = 70.0
+        await _save_job(job)
+        mesh = meshes[0]
+        del meshes
+        for _ in range(3):
+            gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("VRAM cleared — all models are on CPU, ready for GLB export")
 
-		job.message = "Exporting & uploading GLB..."
-		job.progress = 80.0
-		await _save_job(job)
-		glb_url = await loop.run_in_executor(
-			None, functools.partial(
-				_export_and_upload_glb,
-				mesh_vertices, mesh_faces, mesh_attrs, mesh_coords,
-				mesh_layout, mesh_voxel_size,
-				job.request, job.job_id,
-			)
-		)
-		del mesh_vertices, mesh_faces, mesh_attrs, mesh_coords, mesh_layout, mesh_voxel_size
-		for _ in range(3):
-			gc.collect()
+        mesh_vertices = mesh.vertices
+        mesh_faces = mesh.faces
+        mesh_attrs = mesh.attrs
+        mesh_coords = mesh.coords
+        mesh_layout = mesh.layout
+        mesh_voxel_size = mesh.voxel_size
+        n_vertices = int(mesh_vertices.shape[0])
+        n_faces = int(mesh_faces.shape[0])
+        del mesh
+        for _ in range(3):
+            gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
+        logger.info(f"RAM before GLB export: {_rss_mb:.0f} MB")
 
-		job.message = "Finalizing..."
-		job.progress = 95.0
+        job.message = "Exporting & uploading GLB..."
+        job.progress = 80.0
+        await _save_job(job)
+        glb_url = await loop.run_in_executor(
+            None, functools.partial(
+                _export_and_upload_glb,
+                mesh_vertices, mesh_faces, mesh_attrs, mesh_coords,
+                mesh_layout, mesh_voxel_size,
+                job.request, job.job_id,
+            )
+        )
+        del mesh_vertices, mesh_faces, mesh_attrs, mesh_coords, mesh_layout, mesh_voxel_size
+        for _ in range(3):
+            gc.collect()
 
-		generation_time = time.time() - job.started_at
-		job.result = GenerateResponse(
-			glb_url=glb_url,
-			vertices=n_vertices,
-			faces=n_faces,
-			generation_time=round(generation_time, 2),
-		)
+        job.message = "Finalizing..."
+        job.progress = 95.0
 
-		gc.collect()
+        generation_time = time.time() - job.started_at
+        job.result = GenerateResponse(
+            glb_url=glb_url,
+            vertices=n_vertices,
+            faces=n_faces,
+            generation_time=round(generation_time, 2),
+        )
 
-		job.status = JobStatus.COMPLETED
-		job.progress = 100.0
-		job.message = "Generation completed"
-		job.completed_at = time.time()
-		await _save_job(job)
+        gc.collect()
 
-		_avg_generation_time = _avg_generation_time * 0.8 + generation_time * 0.2
-		logger.info(f"Job {job.job_id} completed in {generation_time:.2f}s (avg: {_avg_generation_time:.1f}s)")
+        job.status = JobStatus.COMPLETED
+        job.progress = 100.0
+        job.message = "Generation completed"
+        job.completed_at = time.time()
+        await _save_job(job)
 
-	except Exception as exc:
-		job.status = JobStatus.FAILED
-		job.error = str(exc)
-		job.message = f"Generation failed: {exc}"
-		job.completed_at = time.time()
-		await _save_job(job)
-		logger.error(f"Job {job.job_id} failed: {exc}\n{traceback.format_exc()}")
-	finally:
-		if torch.cuda.is_available():
-			torch.cuda.empty_cache()
-			torch.cuda.synchronize()
-			logger.info(f"GPU cache cleared for job {job.job_id}")
+        _avg_generation_time = _avg_generation_time * 0.8 + generation_time * 0.2
+        logger.info(f"Job {job.job_id} completed in {generation_time:.2f}s (avg: {_avg_generation_time:.1f}s)")
 
-		for _ in range(5):
-			gc.collect()
-		try:
-			import ctypes
-			ctypes.CDLL("libc.so.6").malloc_trim(0)
-			logger.info("malloc_trim: RAM returned to OS")
-		except Exception:
-			pass
-		_rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
-		logger.info(f"RAM after job cleanup: {_rss_mb:.0f} MB")
+    except Exception as exc:
+        job.status = JobStatus.FAILED
+        job.error = str(exc)
+        job.message = f"Generation failed: {exc}"
+        job.completed_at = time.time()
+        await _save_job(job)
+        logger.error(f"Job {job.job_id} failed: {exc}\n{traceback.format_exc()}")
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info(f"GPU cache cleared for job {job.job_id}")
+
+        for _ in range(5):
+            gc.collect()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            logger.info("malloc_trim: RAM returned to OS")
+        except Exception:
+            pass
+        _rss_mb = psutil.Process().memory_info().rss / 1024 / 1024
+        logger.info(f"RAM after job cleanup: {_rss_mb:.0f} MB")
 
 
+# ---------------------------------------------------------
+# [THÊM MỚI] Hàm xử lý riêng cho Enhance Texture
+# ---------------------------------------------------------
+async def process_enhance_job(job: Job):
+    global texturing_pipeline
+    req = job._enhance_request # EnhanceRequest object
+
+    job.status = JobStatus.PROCESSING
+    job.started_at = time.time()
+    job.progress = 10.0
+    job.message = "Downloading original GLB..."
+    await _save_job(job)
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        import urllib.request
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
+            urllib.request.urlretrieve(req.glb_url, tmp.name)
+            local_glb_path = tmp.name
+
+        job.message = "Loading mesh & decoding image..."
+        job.progress = 30.0
+        await _save_job(job)
+
+        image_bytes = base64.b64decode(req.image)
+        reference_image = Image.open(io.BytesIO(image_bytes))
+        del image_bytes
+
+        def _run_texturing():
+            logger.info(f"[Texture Refinement] Input GLB: {req.glb_url}")
+            logger.info(f"[Texture Refinement] Resolution: {req.resolution}, Texture size: {req.texture_size}")
+            logger.info(f"[Texture Refinement] Steps: {req.tex_slat_sampling_steps}, Guidance: {req.tex_slat_guidance_strength}")
+            
+            import trimesh
+            mesh = trimesh.load(local_glb_path)
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.to_mesh() # Trích xuất mesh nếu nó là Scene
+            
+            texturing_pipeline._device = torch.device("cuda")
+            try:
+                refined_mesh = texturing_pipeline.run(
+                    mesh=mesh,
+                    image=reference_image,
+                    seed=req.seed,
+                    preprocess_image=True,
+                    resolution=req.resolution,
+                    texture_size=req.texture_size,
+                    tex_slat_sampler_params={
+                        "steps": req.tex_slat_sampling_steps,
+                        "guidance_strength": req.tex_slat_guidance_strength,
+                        "guidance_rescale": req.tex_slat_guidance_rescale,
+                        "rescale_t": req.tex_slat_rescale_t,
+                    }
+                )
+                
+                out_path = local_glb_path.replace(".glb", "_refined.glb")
+                refined_mesh.export(out_path, extension_webp=True)
+                return out_path
+            finally:
+                texturing_pipeline._device = torch.device("cpu")
+                texturing_pipeline.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        refined_glb_path = await loop.run_in_executor(None, _run_texturing)
+
+        job.message = "Uploading refined GLB..."
+        job.progress = 85.0
+        await _save_job(job)
+
+        bucket = _get_gcs_client().bucket(GCS_BUCKET)
+        object_name = f"{GCS_GLB_PREFIX}/{job.job_id}_refined.glb"
+        blob = bucket.blob(object_name)
+        blob.upload_from_filename(refined_glb_path, content_type="model/gltf-binary")
+        public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
+
+        import os
+        os.unlink(local_glb_path)
+        os.unlink(refined_glb_path)
+
+        # Hoàn tất
+        generation_time = time.time() - job.started_at
+        job.result = GenerateResponse(
+            glb_url=public_url,
+            vertices=0,
+            faces=0,
+            generation_time=round(generation_time, 2),
+        )
+        job.status = JobStatus.COMPLETED
+        job.progress = 100.0
+        job.message = "Texture refinement completed"
+        job.completed_at = time.time()
+        await _save_job(job)
+
+    except Exception as exc:
+        job.status = JobStatus.FAILED
+        job.error = str(exc)
+        job.message = f"Enhance failed: {exc}"
+        job.completed_at = time.time()
+        await _save_job(job)
+        logger.error(f"Enhance Job {job.job_id} failed: {exc}\n{traceback.format_exc()}")
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        for _ in range(5):
+            gc.collect()
+
+async def process_enhance_job(job: Job):
+    global texturing_pipeline
+    req: EnhanceRequest = job._enhance_request
+
+    job.status = JobStatus.PROCESSING
+    job.started_at = time.time()
+    job.progress = 10.0
+    job.message = "Downloading original GLB..."
+    await _save_job(job)
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        # 1. Tải GLB cũ
+        with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as tmp:
+            urllib.request.urlretrieve(req.glb_url, tmp.name)
+            local_glb_path = tmp.name
+
+        job.message = "Loading mesh & decoding image..."
+        job.progress = 30.0
+        await _save_job(job)
+
+        images = _decode_base64_images([req.image])
+        reference_image = images[0]
+
+        # 2. Xử lý Enhance (Chạy trên Executor để không block event loop)
+        def _run_texturing():
+            logger.info(f"[Texture Refinement] Input GLB: {req.glb_url}")
+            logger.info(f"[Texture Refinement] Resolution: {req.resolution}, Texture size: {req.texture_size}")
+            logger.info(f"[Texture Refinement] Steps: {req.tex_slat_sampling_steps}, Guidance: {req.tex_slat_guidance_strength}")
+            
+            # Load mesh bằng trimesh
+            mesh = trimesh.load(local_glb_path)
+            if isinstance(mesh, trimesh.Scene):
+                mesh = mesh.to_mesh() # Trích xuất mesh từ Scene
+            
+            texturing_pipeline._device = torch.device("cuda")
+            try:
+                # Chạy pipeline theo đúng chuẩn app_texturing.py
+                refined_mesh = texturing_pipeline.run(
+                    mesh=mesh,
+                    image=reference_image,
+                    seed=req.seed,
+                    preprocess_image=True,
+                    resolution=req.resolution,
+                    texture_size=req.texture_size,
+                    tex_slat_sampler_params={
+                        "steps": req.tex_slat_sampling_steps,
+                        "guidance_strength": req.tex_slat_guidance_strength,
+                        "guidance_rescale": req.tex_slat_guidance_rescale,
+                        "rescale_t": req.tex_slat_rescale_t,
+                    }
+                )
+                
+                # Xuất ra file tạm
+                out_path = local_glb_path.replace(".glb", "_refined.glb")
+                refined_mesh.export(out_path, extension_webp=True)
+                return out_path
+            finally:
+                texturing_pipeline._device = torch.device("cpu")
+                texturing_pipeline.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        refined_glb_path = await loop.run_in_executor(None, _run_texturing)
+
+        job.message = "Uploading refined GLB..."
+        job.progress = 85.0
+        await _save_job(job)
+
+        # 3. Upload lên GCS
+        bucket = _get_gcs_client().bucket(GCS_BUCKET)
+        object_name = f"{GCS_GLB_PREFIX}/{job.job_id}_refined.glb"
+        blob = bucket.blob(object_name)
+        blob.upload_from_filename(refined_glb_path, content_type="model/gltf-binary")
+        public_url = f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}"
+
+        # Dọn dẹp file tạm
+        os.unlink(local_glb_path)
+        os.unlink(refined_glb_path)
+
+        # Hoàn tất
+        generation_time = time.time() - job.started_at
+        job.result = GenerateResponse(
+            glb_url=public_url,
+            vertices=0, # Bỏ qua đếm vertices/faces cho nhánh enhance để tiết kiệm chi phí tính toán
+            faces=0,
+            generation_time=round(generation_time, 2),
+        )
+        job.status = JobStatus.COMPLETED
+        job.progress = 100.0
+        job.message = "Texture refinement completed"
+        job.completed_at = time.time()
+        await _save_job(job)
+
+    except Exception as exc:
+        job.status = JobStatus.FAILED
+        job.error = str(exc)
+        job.message = f"Enhance failed: {exc}"
+        job.completed_at = time.time()
+        await _save_job(job)
+        logger.error(f"Enhance Job {job.job_id} failed: {exc}")
 
 def _export_and_upload_glb(
 	vertices, faces, attrs, coords, layout, voxel_size,

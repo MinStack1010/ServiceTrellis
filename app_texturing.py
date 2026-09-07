@@ -83,26 +83,95 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
     
     with gr.Row():
         with gr.Column(scale=1, min_width=360):
-            mesh_file = gr.File(label="Upload Mesh", file_types=[".ply", ".obj", ".glb", ".gltf"], file_count="single")
-            image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
-            
-            resolution = gr.Radio(["512", "1024", "1536"], label="Resolution", value="1024")
-            seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
-            randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
-            texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
-            
-            generate_btn = gr.Button("Generate")
-                
-            with gr.Accordion(label="Advanced Settings", open=False):                
-                with gr.Row():
-                    tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1)
-                    tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01)
-                    tex_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
-                    tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)                
+            mesh_file = gr.File(
+                label="Upload Mesh",
+                file_types=[".ply", ".obj", ".glb", ".gltf"],
+                file_count="single"
+            )
 
-        with gr.Column(scale=10):
-            glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
-            download_btn = gr.DownloadButton(label="Download GLB")
+            image_prompt = gr.Image(
+                label="Image Prompt",
+                format="png",
+                image_mode="RGBA",
+                type="pil",
+                height=400
+            )
+
+            resolution = gr.Radio(
+                ["512", "1024", "1536"],
+                label="Resolution",
+                value="1536"
+            )
+
+            seed = gr.Slider(
+                0,
+                MAX_SEED,
+                label="Seed",
+                value=0,
+                step=1
+            )
+
+        randomize_seed = gr.Checkbox(
+            label="Randomize Seed",
+            value=True
+        )
+
+        texture_size = gr.Slider(
+            1024,
+            4096,
+            label="Texture Size",
+            value=4096,
+            step=1024
+        )
+
+        generate_btn = gr.Button("Generate")
+
+        with gr.Accordion(label="Advanced Settings", open=False):
+            with gr.Row():
+                tex_slat_guidance_strength = gr.Slider(
+                    1.0,
+                    10.0,
+                    label="Guidance Strength",
+                    value=2.0,
+                    step=0.1
+                )
+
+                tex_slat_guidance_rescale = gr.Slider(
+                    0.0,
+                    1.0,
+                    label="Guidance Rescale",
+                    value=0.15,
+                    step=0.01
+                )
+
+                tex_slat_sampling_steps = gr.Slider(
+                    1,
+                    50,
+                    label="Sampling Steps",
+                    value=24,
+                    step=1
+                )
+
+                tex_slat_rescale_t = gr.Slider(
+                    1.0,
+                    6.0,
+                    label="Rescale T",
+                    value=3.5,
+                    step=0.1
+                )
+
+    with gr.Column(scale=10):
+        glb_output = gr.Model3D(
+            label="Extracted GLB",
+            height=724,
+            show_label=True,
+            display_mode="solid",
+            clear_color=(0.25, 0.25, 0.25, 1.0)
+        )
+
+        download_btn = gr.DownloadButton(
+            label="Download GLB"
+        )
                         
 
     # Handlers

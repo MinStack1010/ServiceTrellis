@@ -975,8 +975,9 @@ async def process_enhance_job(job: Job):
         job.progress = 30.0
         await _save_job(job)
 
-        images = _decode_base64_images([req.image])
-        reference_image = images[0]
+        image_bytes = base64.b64decode(req.image)
+        reference_image = Image.open(io.BytesIO(image_bytes))
+        del image_bytes
 
         # 2. Xử lý Enhance (Chạy trên Executor để không block event loop)
         def _run_texturing():

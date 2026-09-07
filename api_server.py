@@ -271,6 +271,19 @@ def _is_busy() -> bool:
 	)
 
 
+def _decode_base64_images(encoded_images: list[str]) -> list[Image.Image]:
+	"""Decode request images once per caller, with consistent validation errors."""
+	images: list[Image.Image] = []
+	for index, encoded_image in enumerate(encoded_images, start=1):
+		try:
+			image_bytes = base64.b64decode(encoded_image, validate=True)
+			with Image.open(io.BytesIO(image_bytes)) as source:
+				images.append(source.convert("RGB"))
+		except Exception as exc:
+			raise ValueError(f"Invalid image {index}: {exc}") from exc
+	return images
+
+
 def _model_to_gpu(model_key: str) -> None:
 	if torch.cuda.is_available() and pipeline is not None:
 		m = pipeline.models.get(model_key)
@@ -296,6 +309,17 @@ async def lifespan(app: FastAPI):
 	model_id = os.environ.get("TRELLIS2_MODEL", "microsoft/TRELLIS.2-4B")
 	
 	pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
+	multi_view_checkpoint = os.environ.get("TRELLIS2_MULTI_VIEW_CHECKPOINT")
+	if multi_view_checkpoint and not pipeline.multi_view_ready:
+		pipeline.load_multi_view_checkpoint(multi_view_checkpoint)
+	if os.environ.get("TRELLIS2_ALLOW_UNTRAINED_MULTI_VIEW", "").lower() in {"1", "true", "yes"}:
+		if pipeline.multi_view_fusion is None:
+			pipeline.configure_multi_view_conditioning()
+		pipeline.allow_untrained_multi_view = True
+		logger.warning(
+			"TRELLIS2_ALLOW_UNTRAINED_MULTI_VIEW is enabled: multi-view requests are "
+			"development-only and do not provide reliable reconstruction quality."
+		)
 	pipeline.cpu()
 	logger.info("Pipeline loaded into CPU RAM (per-stage GPU loading enabled)")
 
@@ -385,7 +409,12 @@ async def health():
 	ready = pipeline is not None and bool(getattr(pipeline, "models", None))
 	if not ready:
 		return HealthResponse(status="loading", weights_loaded=False)
-	return HealthResponse(status="ok", weights_loaded=True)
+	return HealthResponse(
+		status="ok",
+		weights_loaded=True,
+		multi_view_configured=pipeline.multi_view_fusion is not None,
+		multi_view_checkpoint_loaded=pipeline.multi_view_ready,
+	)
 
 
 @app.get("/queue/status", response_model=QueueStatusResponse)
@@ -431,10 +460,21 @@ async def generate(request: GenerateRequest):
 		)
 
 	try:
-		image_bytes = base64.b64decode(request.image)
-		Image.open(io.BytesIO(image_bytes))
-	except Exception as exc:
-		raise HTTPException(status_code=400, detail=f"Invalid image: {exc}") from exc
+		_decode_base64_images(request.images or [])
+	except ValueError as exc:
+		raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+	if len(request.images or []) > 1 and not pipeline.multi_view_ready:
+		if not pipeline.allow_untrained_multi_view:
+			raise HTTPException(
+				status_code=503,
+				detail=(
+					"Multi-view reconstruction is unavailable: load a trained "
+					"multi-view fusion/adapter checkpoint. The published TRELLIS.2 "
+					"checkpoint supports only single-view conditioning."
+				),
+			)
+		logger.warning("Accepting a multi-view request in explicit untrained development mode")
 
 	job_id = str(uuid.uuid4())
 	job = Job(
@@ -537,11 +577,9 @@ async def process_job(job: Job):
 	loop = asyncio.get_event_loop()
 
 	try:
-		job.message = "Decoding image..."
+		job.message = "Decoding image views..."
 		job.progress = 5.0
-		image_bytes = base64.b64decode(job.request.image)
-		image = Image.open(io.BytesIO(image_bytes))
-		del image_bytes
+		images = _decode_base64_images(job.request.images or [])
 
 		pipeline_type = PIPELINE_TYPE_MAP.get(job.request.pipeline_type, job.request.pipeline_type)
 
@@ -585,11 +623,15 @@ async def process_job(job: Job):
 
 			pipeline._device = torch.device("cuda")
 			try:
-				S['proc_img'] = pipeline.preprocess_image(image)
+				S['proc_imgs'] = [pipeline.preprocess_image(image) for image in images]
 				torch.manual_seed(job.request.seed)
-				S['cond_512'] = pipeline.get_cond([S['proc_img']], 512)
-				S['cond_1024'] = pipeline.get_cond([S['proc_img']], 1024) if pipeline_type != "512" else None
-				del S['proc_img']
+				S['cond_512'] = pipeline.get_cond_from_images(
+					S['proc_imgs'], 512, camera_metadata=job.request.camera_metadata,
+				)
+				S['cond_1024'] = pipeline.get_cond_from_images(
+					S['proc_imgs'], 1024, camera_metadata=job.request.camera_metadata,
+				) if pipeline_type != "512" else None
+				del S['proc_imgs']
 
 				ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
 				S['coords'] = pipeline.sample_sparse_structure(
@@ -683,10 +725,11 @@ async def process_job(job: Job):
 				pipeline._device = torch.device("cuda")
 				try:
 					return pipeline.run(
-						image,
+						images=images,
 						seed=job.request.seed,
 						preprocess_image=True,
 						pipeline_type=pipeline_type,
+						camera_metadata=job.request.camera_metadata,
 						sparse_structure_sampler_params=sparse_structure_sampler_params,
 						shape_slat_sampler_params=shape_slat_sampler_params,
 						tex_slat_sampler_params=tex_slat_sampler_params,
@@ -699,7 +742,7 @@ async def process_job(job: Job):
 			meshes = await loop.run_in_executor(None, _run_full)
 			resolution = None
 
-		del image
+		del images
 		gc.collect()
 
 		if not meshes:

@@ -4,7 +4,7 @@ from typing import *
 import numpy as np
 import torch
 import utils3d.torch
-from .components import StandardDatasetBase, ImageConditionedMixin
+from .components import StandardDatasetBase, ImageConditionedMixin, MultiViewImageConditionedMixin
 from ..modules.sparse.basic import SparseTensor
 from .. import models
 from ..utils.render_utils import get_renderer
@@ -207,4 +207,9 @@ class ImageConditionedSLat(ImageConditionedMixin, SLat):
     """
     Image conditioned structured latent dataset
     """
+    pass
+
+
+class MultiViewImageConditionedSLat(MultiViewImageConditionedMixin, SLat):
+    """Structured-latent training data with explicit padded view dimension."""
     pass

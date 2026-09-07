@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import cv2
 from .. import models
-from .components import StandardDatasetBase, ImageConditionedMixin
+from .components import StandardDatasetBase, ImageConditionedMixin, MultiViewImageConditionedMixin
 from ..modules.sparse import SparseTensor, sparse_cat
 from ..representations import MeshWithVoxel
 from ..renderers import PbrMeshRenderer, EnvMap
@@ -287,4 +287,9 @@ class ImageConditionedSLatPbr(ImageConditionedMixin, SLatPbr):
     """
     Image conditioned structured latent dataset
     """
+    pass
+
+
+class MultiViewImageConditionedSLatPbr(MultiViewImageConditionedMixin, SLatPbr):
+    """Texture-SLAT training data with explicit padded view dimension."""
     pass

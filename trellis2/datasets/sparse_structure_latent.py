@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from ..representations import Voxel
 from ..renderers import VoxelRenderer
-from .components import StandardDatasetBase, ImageConditionedMixin
+from .components import StandardDatasetBase, ImageConditionedMixin, MultiViewImageConditionedMixin
 from .. import models
 from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
 
@@ -156,5 +156,12 @@ class ImageConditionedSparseStructureLatent(ImageConditionedMixin, SparseStructu
     """
     Image-conditioned sparse structure dataset
     """
+    pass
+
+
+class MultiViewImageConditionedSparseStructureLatent(
+    MultiViewImageConditionedMixin, SparseStructureLatent
+):
+    """Sparse-structure training data with padded views and a valid-view mask."""
     pass
     

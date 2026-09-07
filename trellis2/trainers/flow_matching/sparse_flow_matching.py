@@ -15,6 +15,7 @@ from .flow_matching import FlowMatchingTrainer
 from .mixins.classifier_free_guidance import ClassifierFreeGuidanceMixin
 from .mixins.text_conditioned import TextConditionedMixin
 from .mixins.image_conditioned import ImageConditionedMixin, MultiImageConditionedMixin
+from .mixins.multiview_conditioned import MultiViewConditionedMixin
 
 
 class SparseFlowMatchingTrainer(FlowMatchingTrainer):
@@ -95,7 +96,15 @@ class SparseFlowMatchingTrainer(FlowMatchingTrainer):
         noise = x_0.replace(torch.randn_like(x_0.feats))
         t = self.sample_t(x_0.shape[0]).to(x_0.device).float()
         x_t = self.diffuse(x_0, t, noise=noise)
-        cond = self.get_cond(cond, **kwargs)
+        # View masks and camera metadata are conditioner-only inputs. Do not
+        # forward them to the frozen TRELLIS denoiser, whose published forward
+        # signature does not accept multi-view metadata.
+        conditioning_kwargs = {
+            key: kwargs.pop(key)
+            for key in ('view_mask', 'camera_metadata')
+            if key in kwargs
+        }
+        cond = self.get_cond(cond, **conditioning_kwargs)
         
         pred = self.training_models['denoiser'](x_t, t * 1000, cond, **kwargs)
         assert pred.shape == noise.shape == x_0.shape
@@ -285,7 +294,7 @@ class ImageConditionedSparseFlowMatchingCFGTrainer(ImageConditionedMixin, Sparse
     pass
 
 
-class MultiImageConditionedSparseFlowMatchingCFGTrainer(MultiImageConditionedMixin, SparseFlowMatchingCFGTrainer):
+class MultiImageConditionedSparseFlowMatchingCFGTrainer(MultiViewConditionedMixin, SparseFlowMatchingCFGTrainer):
     """
     Trainer for sparse image-conditioned diffusion model with flow matching objective and classifier-free guidance.
     
@@ -322,4 +331,13 @@ class MultiImageConditionedSparseFlowMatchingCFGTrainer(MultiImageConditionedMix
         p_uncond (float): Probability of dropping conditions.
         image_cond_model (str): Image conditioning model.
     """
+    pass
+
+
+# Explicit name for new configs. Keep the historical name above as a
+# compatibility alias, but it now uses true learned fusion rather than token
+# flattening.
+class MultiViewConditionedSparseFlowMatchingCFGTrainer(
+    MultiViewConditionedMixin, SparseFlowMatchingCFGTrainer
+):
     pass

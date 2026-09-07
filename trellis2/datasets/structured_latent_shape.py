@@ -4,7 +4,7 @@ from typing import *
 import numpy as np
 import torch
 from .. import models
-from .components import ImageConditionedMixin
+from .components import ImageConditionedMixin, MultiViewImageConditionedMixin
 from ..modules.sparse import SparseTensor
 from .structured_latent import SLatVisMixin, SLat
 from ..utils.render_utils import get_renderer, yaw_pitch_r_fov_to_extrinsics_intrinsics
@@ -93,4 +93,9 @@ class ImageConditionedSLatShape(ImageConditionedMixin, SLatShape):
     """
     Image conditioned structured latent for shape generation
     """
+    pass
+
+
+class MultiViewImageConditionedSLatShape(MultiViewImageConditionedMixin, SLatShape):
+    """Shape-SLAT training data with explicit padded view dimension."""
     pass

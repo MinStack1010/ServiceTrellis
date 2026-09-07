@@ -1,4 +1,6 @@
 from typing import *
+import logging
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -7,7 +9,19 @@ from .base import Pipeline
 from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
+from ..modules.multiview_conditioning import (
+    MultiViewConditioningAdapter,
+    MultiViewConditioningConfig,
+    MultiViewFeatureFusion,
+)
 from ..representations import Mesh, MeshWithVoxel
+
+
+logger = logging.getLogger(__name__)
+
+
+class MultiViewCheckpointUnavailable(RuntimeError):
+    """Raised when a caller requests multi-view inference without trained weights."""
 
 
 class Trellis2ImageTo3DPipeline(Pipeline):
@@ -54,6 +68,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         rembg_model: Callable = None,
         low_vram: bool = True,
         default_pipeline_type: str = '1024_cascade',
+        multi_view_fusion: Optional[MultiViewFeatureFusion] = None,
+        multi_view_adapter: Optional[MultiViewConditioningAdapter] = None,
+        multi_view_config: Optional[dict] = None,
+        multi_view_checkpoint_loaded: bool = False,
+        allow_untrained_multi_view: bool = False,
     ):
         if models is None:
             return
@@ -70,6 +89,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self.rembg_model = rembg_model
         self.low_vram = low_vram
         self.default_pipeline_type = default_pipeline_type
+        self.multi_view_fusion = multi_view_fusion
+        self.multi_view_adapter = multi_view_adapter
+        self.multi_view_config = multi_view_config
+        self.multi_view_checkpoint_loaded = multi_view_checkpoint_loaded
+        self.multi_view_checkpoint_path: Optional[str] = None
+        self.allow_untrained_multi_view = allow_untrained_multi_view
         self.pbr_attr_layout = {
             'base_color': slice(0, 3),
             'metallic': slice(3, 4),
@@ -114,6 +139,23 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         }
         pipeline._device = 'cpu'
 
+        # The published checkpoint has no multi-view adapter. A model package
+        # may opt in by describing the adapter and shipping a separate trained
+        # checkpoint. Randomly initialized adapters are never treated as ready.
+        multi_view_config = args.get('multi_view_conditioning')
+        if multi_view_config:
+            pipeline.configure_multi_view_conditioning(multi_view_config)
+            checkpoint_path = (
+                os.environ.get("TRELLIS2_MULTI_VIEW_CHECKPOINT")
+                or multi_view_config.get("checkpoint")
+            )
+            if checkpoint_path:
+                pipeline.load_multi_view_checkpoint(checkpoint_path)
+        pipeline.allow_untrained_multi_view = (
+            os.environ.get("TRELLIS2_ALLOW_UNTRAINED_MULTI_VIEW", "").lower()
+            in {"1", "true", "yes"}
+        )
+
         return pipeline
 
     def to(self, device: torch.device) -> None:
@@ -123,6 +165,134 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             self.image_cond_model.to(device)
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
+            if self.multi_view_fusion is not None:
+                self.multi_view_fusion.to(device)
+            if self.multi_view_adapter is not None:
+                self.multi_view_adapter.to(device)
+
+    def _condition_feature_dim(self) -> int:
+        """Return and cross-check the feature size consumed by all flow stages."""
+        flow_model_keys = [
+            'sparse_structure_flow_model',
+            'shape_slat_flow_model_512',
+            'shape_slat_flow_model_1024',
+            'tex_slat_flow_model_512',
+            'tex_slat_flow_model_1024',
+        ]
+        dimensions = {
+            model.cond_channels
+            for key in flow_model_keys
+            if (model := self.models.get(key)) is not None and hasattr(model, 'cond_channels')
+        }
+        if not dimensions:
+            raise RuntimeError("Unable to determine TRELLIS conditioning feature dimension")
+        if len(dimensions) != 1:
+            raise RuntimeError(f"TRELLIS flow models disagree on cond_channels: {dimensions}")
+        return dimensions.pop()
+
+    def configure_multi_view_conditioning(self, config: Optional[dict] = None) -> None:
+        """Create untrained multi-view modules from an explicit architecture config.
+
+        This is a development/training hook. Calling it does *not* enable
+        reliable multi-view inference: :meth:`load_multi_view_checkpoint` must
+        subsequently load compatible trained fusion and adapter weights.
+        """
+        config = dict(config or {})
+        expected_feature_dim = self._condition_feature_dim()
+        feature_dim = config.get('feature_dim', expected_feature_dim)
+        if feature_dim != expected_feature_dim:
+            raise ValueError(
+                "multi-view feature_dim must equal the TRELLIS flow model "
+                f"cond_channels ({expected_feature_dim}), got {feature_dim}"
+            )
+        known_keys = set(MultiViewConditioningConfig.__dataclass_fields__)  # type: ignore[attr-defined]
+        fusion_config = MultiViewConditioningConfig(**{
+            key: config[key] for key in known_keys if key in config
+        })
+        self.multi_view_fusion = MultiViewFeatureFusion(fusion_config)
+        self.multi_view_adapter = MultiViewConditioningAdapter(
+            fusion_config.feature_dim,
+            mlp_ratio=config.get('adapter_mlp_ratio', 2.0),
+        )
+        self.multi_view_config = {
+            **fusion_config.to_dict(),
+            'adapter_mlp_ratio': config.get('adapter_mlp_ratio', 2.0),
+        }
+        self.multi_view_checkpoint_loaded = False
+        self.multi_view_checkpoint_path = None
+
+    @property
+    def multi_view_ready(self) -> bool:
+        """Whether trained, separate multi-view weights are available."""
+        return bool(
+            self.multi_view_fusion is not None
+            and self.multi_view_adapter is not None
+            and self.multi_view_checkpoint_loaded
+        )
+
+    def multi_view_status(self) -> dict:
+        """Return an explicit status suitable for health/debug reporting."""
+        return {
+            'configured': self.multi_view_fusion is not None and self.multi_view_adapter is not None,
+            'checkpoint_loaded': self.multi_view_checkpoint_loaded,
+            'checkpoint_path': self.multi_view_checkpoint_path,
+            'allow_untrained_development_mode': self.allow_untrained_multi_view,
+            'config': self.multi_view_config,
+        }
+
+    def load_multi_view_checkpoint(self, checkpoint_path: str) -> None:
+        """Load a trained fusion/adapter checkpoint saved by the training hook.
+
+        The checkpoint format is a ``torch.save`` dictionary containing
+        ``multi_view_fusion`` and ``multi_view_adapter`` state dicts, plus an
+        optional ``config`` matching :class:`MultiViewConditioningConfig`.
+        """
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"Multi-view checkpoint not found: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        except TypeError:  # PyTorch versions before weights_only support.
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Multi-view checkpoint must be a state-dict dictionary")
+        checkpoint_config = checkpoint.get('config')
+        if self.multi_view_fusion is None or self.multi_view_adapter is None:
+            self.configure_multi_view_conditioning(checkpoint_config)
+        elif checkpoint_config and self.multi_view_config != {
+            **{key: checkpoint_config[key] for key in MultiViewConditioningConfig.__dataclass_fields__ if key in checkpoint_config},  # type: ignore[attr-defined]
+            'adapter_mlp_ratio': checkpoint_config.get('adapter_mlp_ratio', 2.0),
+        }:
+            raise ValueError("Loaded multi-view checkpoint architecture does not match pipeline config")
+        try:
+            self.multi_view_fusion.load_state_dict(checkpoint['multi_view_fusion'], strict=True)  # type: ignore[union-attr]
+            self.multi_view_adapter.load_state_dict(checkpoint['multi_view_adapter'], strict=True)  # type: ignore[union-attr]
+        except KeyError as exc:
+            raise ValueError(
+                "Multi-view checkpoint must contain 'multi_view_fusion' and "
+                "'multi_view_adapter' state dicts"
+            ) from exc
+        self.multi_view_checkpoint_loaded = True
+        self.multi_view_checkpoint_path = checkpoint_path
+
+    def save_multi_view_checkpoint(self, checkpoint_path: str) -> None:
+        """Save the trainable multi-view modules without the TRELLIS backbone."""
+        if self.multi_view_fusion is None or self.multi_view_adapter is None:
+            raise RuntimeError("Multi-view conditioning has not been configured")
+        os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
+        torch.save({
+            'config': self.multi_view_config,
+            'multi_view_fusion': self.multi_view_fusion.state_dict(),
+            'multi_view_adapter': self.multi_view_adapter.state_dict(),
+        }, checkpoint_path)
+
+    def get_trainable_multi_view_modules(self) -> dict[str, nn.Module]:
+        """Expose only the learned fusion/adapter parameters for fine-tuning."""
+        if self.multi_view_fusion is None or self.multi_view_adapter is None:
+            raise RuntimeError("Multi-view conditioning has not been configured")
+        return {
+            'multi_view_fusion': self.multi_view_fusion,
+            'multi_view_adapter': self.multi_view_adapter,
+        }
 
     def preprocess_image(self, input: Image.Image) -> Image.Image:
         """
@@ -163,10 +333,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         
     def get_cond(self, image: Union[torch.Tensor, list[Image.Image]], resolution: int, include_neg_cond: bool = True) -> dict:
         """
-        Get the conditioning information for the model.
+        Get the legacy single-view/batched conditioning information for the model.
 
         Args:
-            image (Union[torch.Tensor, list[Image.Image]]): The image prompts.
+            image (Union[torch.Tensor, list[Image.Image]]): A batch of image
+                prompts. A Python list is interpreted as batch dimension ``B``;
+                it is not a multi-view representation and is retained only for
+                compatibility with published single-view TRELLIS.2 weights.
 
         Returns:
             dict: The conditioning information
@@ -185,6 +358,124 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             'neg_cond': neg_cond,
         }
 
+    def _extract_view_features(self, images: Sequence[Image.Image], resolution: int) -> torch.Tensor:
+        """Extract DINO tokens for views of one object as ``[1, V, N, C]``."""
+        if not 1 <= len(images) <= 4:
+            raise ValueError(f"Expected 1-4 images for one object, got {len(images)}")
+        if not all(isinstance(image, Image.Image) for image in images):
+            raise TypeError("images must be PIL.Image.Image instances")
+        self.image_cond_model.image_size = resolution
+        if self.low_vram:
+            self.image_cond_model.to(self.device)
+        features = self.image_cond_model(list(images))
+        if self.low_vram:
+            self.image_cond_model.cpu()
+        if features.ndim != 3 or features.shape[0] != len(images):
+            raise RuntimeError(
+                "Image conditioner must return [V, N, C] features for a "
+                f"single object's views; got {tuple(features.shape)}"
+            )
+        view_features = features.unsqueeze(0)
+        logger.debug(
+            "Multi-view DINO features: input_views=%d shape=%s",
+            len(images), tuple(view_features.shape),
+        )
+        return view_features
+
+    def get_multi_view_cond_from_features(
+        self,
+        features: torch.Tensor,
+        *,
+        view_mask: Optional[torch.Tensor] = None,
+        camera_metadata: Optional[torch.Tensor] = None,
+        include_neg_cond: bool = True,
+    ) -> dict:
+        """Fuse ``[B, V, N, C]`` features into a single TRELLIS condition.
+
+        This method is intentionally separate from :meth:`get_cond`: the
+        latter's list argument means independent batch entries, while this
+        method preserves a dedicated view axis and produces exactly one
+        condition per object in ``B``.
+        """
+        if features.ndim != 4:
+            raise ValueError(
+                "Multi-view features must be [B, V, N, C], not a flattened "
+                f"batch; got {tuple(features.shape)}"
+            )
+        if self.multi_view_fusion is None or self.multi_view_adapter is None:
+            raise MultiViewCheckpointUnavailable(
+                "This TRELLIS checkpoint has no multi-view conditioning "
+                "architecture. Configure it and load a trained multi-view "
+                "fusion/adapter checkpoint before requesting multiple views."
+            )
+        if not self.multi_view_ready and not self.allow_untrained_multi_view:
+            raise MultiViewCheckpointUnavailable(
+                "A trained multi-view conditioning checkpoint is required for "
+                "multi-view reconstruction. The released single-view TRELLIS.2 "
+                "weights cannot reliably use a randomly initialized adapter."
+            )
+        if not self.multi_view_ready:
+            logger.warning(
+                "Using untrained multi-view conditioning in explicit development mode; "
+                "output is not a reliable reconstruction."
+            )
+
+        # DINO features can be bf16; attention weights must use the same dtype.
+        self.multi_view_fusion.to(device=self.device, dtype=features.dtype)
+        self.multi_view_adapter.to(device=self.device, dtype=features.dtype)
+        try:
+            fused = self.multi_view_fusion(features, view_mask, camera_metadata)
+            cond = self.multi_view_adapter(fused)
+        finally:
+            if self.low_vram:
+                self.multi_view_fusion.cpu()
+                self.multi_view_adapter.cpu()
+
+        logger.debug(
+            "Multi-view fused condition: features=%s view_mask=%s fused=%s cond=%s",
+            tuple(features.shape),
+            None if view_mask is None else tuple(view_mask.shape),
+            tuple(fused.shape), tuple(cond.shape),
+        )
+        if not include_neg_cond:
+            return {'cond': cond}
+        return {'cond': cond, 'neg_cond': torch.zeros_like(cond)}
+
+    def get_cond_from_images(
+        self,
+        images: Sequence[Image.Image],
+        resolution: int,
+        *,
+        view_mask: Optional[torch.Tensor] = None,
+        camera_metadata: Optional[Union[torch.Tensor, Sequence[Sequence[float]]]] = None,
+        include_neg_cond: bool = True,
+    ) -> dict:
+        """Build one condition for one object represented by 1-4 images.
+
+        A single image deliberately uses the original path byte-for-byte in
+        spirit (DINO batch size one and the original conditioning shape), so
+        existing pretrained single-image inference remains unchanged.
+        """
+        if not 1 <= len(images) <= 4:
+            raise ValueError(f"Expected 1-4 images for one object, got {len(images)}")
+        if len(images) == 1:
+            return self.get_cond([images[0]], resolution, include_neg_cond)
+
+        features = self._extract_view_features(images, resolution)
+        camera_tensor = None
+        if camera_metadata is not None:
+            camera_tensor = torch.as_tensor(
+                camera_metadata, dtype=features.dtype, device=features.device,
+            )
+            if camera_tensor.ndim == 2:
+                camera_tensor = camera_tensor.unsqueeze(0)
+        return self.get_multi_view_cond_from_features(
+            features,
+            view_mask=view_mask,
+            camera_metadata=camera_tensor,
+            include_neg_cond=include_neg_cond,
+        )
+
     def sample_sparse_structure(
         self,
         cond: dict,
@@ -201,6 +492,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             num_samples (int): The number of samples to generate.
             sampler_params (dict): Additional parameters for the sampler.
         """
+        logger.debug("TRELLIS sparse condition: %s", tuple(cond['cond'].shape))
         # Sample sparse structure latent
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
@@ -253,6 +545,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             coords (torch.Tensor): The coordinates of the sparse structure.
             sampler_params (dict): Additional parameters for the sampler.
         """
+        logger.debug("TRELLIS shape condition: %s", tuple(cond['cond'].shape))
         # Sample structured latent
         noise = SparseTensor(
             feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
@@ -429,6 +722,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             shape_slat (SparseTensor): The structured latent for shape
             sampler_params (dict): Additional parameters for the sampler.
         """
+        logger.debug("TRELLIS texture condition: %s", tuple(cond['cond'].shape))
         # Sample structured latent
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(shape_slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(shape_slat.device)
@@ -518,7 +812,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
     @torch.no_grad()
     def run(
         self,
-        image: Image.Image,
+        image: Optional[Image.Image] = None,
         num_samples: int = 1,
         seed: int = 42,
         sparse_structure_sampler_params: dict = {},
@@ -528,12 +822,17 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        *,
+        images: Optional[Sequence[Image.Image]] = None,
+        view_mask: Optional[torch.Tensor] = None,
+        camera_metadata: Optional[Union[torch.Tensor, Sequence[Sequence[float]]]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
 
         Args:
-            image (Image.Image): The image prompt.
+            image (Image.Image): Legacy single image prompt. It remains fully
+                compatible with published single-view checkpoints.
             num_samples (int): The number of samples to generate.
             seed (int): The random seed.
             sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
@@ -543,7 +842,23 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            images (Sequence[Image.Image]): 1-4 views of one physical object.
+                More than one image requires a separately trained multi-view
+                fusion/adapter checkpoint; it never means a generation batch.
+            view_mask (torch.Tensor): Optional ``[1, V]`` valid-view mask.
+            camera_metadata: Optional per-view metadata accepted only by a
+                multi-view checkpoint configured for its feature dimension.
         """
+        if image is not None and images is not None:
+            raise ValueError("Pass either image or images, not both")
+        object_images = list(images) if images is not None else ([image] if image is not None else [])
+        if not 1 <= len(object_images) <= 4:
+            raise ValueError(f"Expected 1-4 images for one object, got {len(object_images)}")
+        if len(object_images) > 1 and num_samples != 1:
+            raise ValueError(
+                "Multi-view reconstruction represents one object and requires "
+                "num_samples=1; it does not batch independent generations"
+            )
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '512':
@@ -564,10 +879,18 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
         
         if preprocess_image:
-            image = self.preprocess_image(image)
+            object_images = [self.preprocess_image(input_image) for input_image in object_images]
         torch.manual_seed(seed)
-        cond_512 = self.get_cond([image], 512)
-        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+        cond_512 = self.get_cond_from_images(
+            object_images, 512,
+            view_mask=view_mask,
+            camera_metadata=camera_metadata,
+        )
+        cond_1024 = self.get_cond_from_images(
+            object_images, 1024,
+            view_mask=view_mask,
+            camera_metadata=camera_metadata,
+        ) if pipeline_type != '512' else None
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
         coords = self.sample_sparse_structure(
             cond_512, ss_res,

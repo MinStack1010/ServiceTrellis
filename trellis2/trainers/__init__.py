@@ -17,6 +17,7 @@ __attributes = {
     'TextConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     'ImageConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     'MultiImageConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
+    'MultiViewConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     
     'DinoV2FeatureExtractor': 'flow_matching.mixins.image_conditioned',
     'DinoV3FeatureExtractor': 'flow_matching.mixins.image_conditioned',

@@ -7,13 +7,17 @@ __attributes = {
     'SparseStructureLatent': 'sparse_structure_latent',
     'TextConditionedSparseStructureLatent': 'sparse_structure_latent',
     'ImageConditionedSparseStructureLatent': 'sparse_structure_latent',
+    'MultiViewImageConditionedSparseStructureLatent': 'sparse_structure_latent',
     
     'SLat': 'structured_latent',
     'ImageConditionedSLat': 'structured_latent',
+    'MultiViewImageConditionedSLat': 'structured_latent',
     'SLatShape': 'structured_latent_shape',
     'ImageConditionedSLatShape': 'structured_latent_shape',
+    'MultiViewImageConditionedSLatShape': 'structured_latent_shape',
     'SLatPbr': 'structured_latent_svpbr',
     'ImageConditionedSLatPbr': 'structured_latent_svpbr',
+    'MultiViewImageConditionedSLatPbr': 'structured_latent_svpbr',
 }
 
 __submodules = []
@@ -39,8 +43,8 @@ if __name__ == '__main__':
     from .flexi_dual_grid import FlexiDualGridDataset
     from .sparse_voxel_pbr import SparseVoxelPbrDataset
     
-    from .sparse_structure_latent import SparseStructureLatent, ImageConditionedSparseStructureLatent
-    from .structured_latent import SLat, ImageConditionedSLat
-    from .structured_latent_shape import SLatShape, ImageConditionedSLatShape
-    from .structured_latent_svpbr import SLatPbr, ImageConditionedSLatPbr
+    from .sparse_structure_latent import SparseStructureLatent, ImageConditionedSparseStructureLatent, MultiViewImageConditionedSparseStructureLatent
+    from .structured_latent import SLat, ImageConditionedSLat, MultiViewImageConditionedSLat
+    from .structured_latent_shape import SLatShape, ImageConditionedSLatShape, MultiViewImageConditionedSLatShape
+    from .structured_latent_svpbr import SLatPbr, ImageConditionedSLatPbr, MultiViewImageConditionedSLatPbr
     

@@ -133,6 +133,11 @@ class ImageConditionedMixin:
 
 
 class MultiImageConditionedMixin:
+    """Sample variable views, but represent them as padded ``[V, 3, H, W]``.
+
+    The paired ``view_mask`` makes the padding explicit. It is never passed to
+    DINO or interpreted as an independent object in the multi-view trainer.
+    """
     def __init__(self, roots, *, image_size=518, max_image_cond_view = 4, **kwargs):
         self.image_size = image_size
         self.max_image_cond_view = max_image_cond_view
@@ -188,5 +193,16 @@ class MultiImageConditionedMixin:
 
             cond_images.append(img)
 
-        pack['cond'] = [torch.stack(cond_images, dim=0)]  # (V,3,H,W)
+        views = torch.stack(cond_images, dim=0)
+        padded_views = torch.zeros(
+            self.max_image_cond_view, *views.shape[1:], dtype=views.dtype
+        )
+        padded_views[:n_sample_views] = views
+        pack['cond'] = padded_views  # (V_max, 3, H, W)
+        pack['view_mask'] = torch.arange(self.max_image_cond_view) < n_sample_views
         return pack
+
+
+# New name documents the invariant used by the learned fusion trainer. Retain
+# MultiImageConditionedMixin for existing experimental configuration names.
+MultiViewImageConditionedMixin = MultiImageConditionedMixin

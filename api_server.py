@@ -428,59 +428,59 @@ async def queue_status():
 @app.post("/generate", response_model=JobResponse)
 async def generate(request: GenerateRequest):
 
-	if pipeline is None or job_queue is None:
-		raise HTTPException(status_code=503, detail="Pipeline not ready")
+    if pipeline is None or job_queue is None:
+        raise HTTPException(status_code=503, detail="Pipeline not ready")
 
-	if _is_busy():
-		raise HTTPException(
-			status_code=409,
-			detail="Server is busy — a generation job is already running. Please wait for it to finish."
-		)
+    if _is_busy():
+        raise HTTPException(
+            status_code=409,
+            detail="Server is busy — a generation job is already running. Please wait for it to finish."
+        )
 
-	try:
-		image_bytes = base64.b64decode(request.image)
-		Image.open(io.BytesIO(image_bytes))
-	except Exception as exc:
-		raise HTTPException(status_code=400, detail=f"Invalid image: {exc}") from exc
+    try:
+        image_bytes = base64.b64decode(request.image, validate=True)
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img.verify() # Kiểm tra file có phải ảnh hợp lệ không
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image format: {exc}")
 
-	job_id = str(uuid.uuid4())
-	job = Job(
-		job_id=job_id,
-		request=request,
-		status=JobStatus.QUEUED,
-		message="Job queued",
-	)
-	jobs[job_id] = job
-	await _save_job(job)
-	await job_queue.put(job_id)
-	logger.info(f"Job {job_id} created and queued")
+    job_id = str(uuid.uuid4())
+    job = Job(
+        job_id=job_id,
+        request=request,
+        status=JobStatus.QUEUED,
+        message="Job queued",
+    )
+    jobs[job_id] = job
+    await _save_job(job)
+    await job_queue.put(job_id)
+    logger.info(f"Job {job_id} created and queued")
 
-	return JobResponse(job_id=job_id, status=JobStatus.QUEUED)
+    return JobResponse(job_id=job_id, status=JobStatus.QUEUED)
 
 @app.post("/enhance", response_model=JobResponse)
 async def enhance_texture(request: EnhanceRequest):
-    if texturing_pipeline is None or job_queue is None:
+    if globals().get('texturing_pipeline') is None or job_queue is None:
         raise HTTPException(status_code=503, detail="Texturing Pipeline not ready")
 
     if _is_busy():
         raise HTTPException(status_code=409, detail="Server is busy.")
 
     try:
-        images = _decode_base64_images([request.image])
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        image_bytes = base64.b64decode(request.image, validate=True)
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img.verify()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image format: {exc}")
 
     job_id = str(uuid.uuid4())
-    
-    # Tạo một Job ảo để dùng chung hệ thống Queue hiện tại
-    # (Trong thực tế bạn có thể tạo một EnhanceJob class kế thừa từ Job)
+
     job = Job(
         job_id=job_id,
-        request=GenerateRequest(image=request.image), # Mock request để bypass type checker
+        request=GenerateRequest(image=request.image), 
         status=JobStatus.QUEUED,
         message="Enhance job queued",
     )
-    # Lưu request thật vào một trường tạm để worker sử dụng
     job._enhance_request = request 
     job.is_enhance = True
 

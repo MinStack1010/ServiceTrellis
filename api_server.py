@@ -300,7 +300,7 @@ async def lifespan(app: FastAPI):
 	
 	pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model_id)
 	global texturing_pipeline
-	texturing_pipeline = Trellis2TexturingPipeline.from_pretrained(model_id)
+	texturing_pipeline = Trellis2TexturingPipeline.from_pretrained(model_id, config_file="texturing_pipeline.json")
 	texturing_pipeline.cpu()
 	logger.info("Texturing Pipeline loaded into CPU RAM")
 	pipeline.cpu()
